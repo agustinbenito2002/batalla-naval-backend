@@ -19,6 +19,16 @@ app.get('/', (_req, res) => {
   res.json({ status: 'ok', message: 'Backend en funcionamiento. Consulta /health para verificar Supabase.' });
 });
 
+function esErrorTimeout(error) {
+  const mensaje = typeof error?.message === 'string' ? error.message : '';
+  const detalles = typeof error?.details === 'string' ? error.details : '';
+
+  return error?.name === 'TimeoutError' ||
+    error?.name === 'AbortError' ||
+    /^(TimeoutError|AbortError):/.test(mensaje) ||
+    /UND_ERR_CONNECT_TIMEOUT|Connect Timeout Error/i.test(`${mensaje}\n${detalles}`);
+}
+
 async function consultarTabla(req, res, tabla) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tabla)) {
     return res.status(400).json({ error: 'Nombre de tabla no válido.' });
@@ -30,7 +40,11 @@ async function consultarTabla(req, res, tabla) {
   }
 
   try {
-    const { data, error } = await supabase.from(tabla).select('*').limit(limite);
+    const { data, error } = await supabase
+      .from(tabla)
+      .select('*')
+      .limit(limite)
+      .retry(false);
 
     if (error) {
       console.error(`Error de Supabase al consultar "${tabla}":`, {
@@ -40,9 +54,7 @@ async function consultarTabla(req, res, tabla) {
         hint: error.hint,
       });
 
-      const esTimeout = error.name === 'TimeoutError' ||
-        error.name === 'AbortError' ||
-        /^(TimeoutError|AbortError):/.test(error.message || '');
+      const esTimeout = esErrorTimeout(error);
       const status = esTimeout ? 504 : error.code ? 502 : 503;
       return res.status(status).json({
         error: error.message,
@@ -55,7 +67,7 @@ async function consultarTabla(req, res, tabla) {
     return res.json({ data });
   } catch (error) {
     console.error('Error consultando Supabase:', error);
-    const esTimeout = error.name === 'TimeoutError' || error.name === 'AbortError';
+    const esTimeout = esErrorTimeout(error);
     return res.status(esTimeout ? 504 : 503).json({
       error: esTimeout
         ? 'Supabase no respondió dentro del tiempo límite.'
