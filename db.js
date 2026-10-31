@@ -37,4 +37,30 @@ const supabase = createClient(supabaseUrl, supabaseKey, {
   global: { fetch: fetchWithTimeout },
 });
 
-module.exports = supabase;
+function createAdminClient() {
+  const serviceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  if (!serviceRoleKey) return null;
+
+  return createClient(supabaseUrl, serviceRoleKey, {
+    global: { fetch: fetchWithTimeout },
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+}
+
+function createUserClient(accessToken) {
+  return createClient(supabaseUrl, supabaseKey, {
+    global: {
+      fetch: fetchWithTimeout,
+      headers: { Authorization: `Bearer ${accessToken}` },
+    },
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+    },
+  });
+}
+
+module.exports = { supabase, createAdminClient, createUserClient };
