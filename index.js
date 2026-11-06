@@ -1,4 +1,5 @@
 const path = require('node:path');
+const http = require('node:http');
 const express = require('express');
 const dotenv = require('dotenv');
 
@@ -8,6 +9,8 @@ if (envError) {
 }
 
 const { supabase, createAdminClient, createUserClient } = require('./db');
+const { attachRealtime } = require('./realtime');
+const { createChatService, parseConversationId, parseMessageContent } = require('./chat');
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -30,7 +33,7 @@ app.use((req, res, next) => {
     res.set({
       'Access-Control-Allow-Origin': origin,
       'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-      'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
       Vary: 'Origin',
     });
   }
@@ -425,6 +428,63 @@ app.post('/api/perfiles', async (req, res) => {
   }
 });
 
+app.get('/api/perfiles', async (req, res) => {
+  const sesion = await obtenerUsuarioAutenticado(req, res);
+  if (!sesion) return;
+
+  try {
+    const { data, error } = await sesion.client
+      .from('perfiles')
+      .select('id, nombre_usuario, avatar_url, fecha_registro')
+      .eq('id', sesion.user.id)
+      .maybeSingle();
+
+    if (error) return responderErrorSupabase(res, 'consultar el perfil', error);
+    if (!data) {
+      return res.status(404).json({ error: 'No existe un perfil para este usuario.' });
+    }
+    return res.json({ data });
+  } catch (error) {
+    const esTimeout = esErrorTimeout(error);
+    console.error('Error consultando el perfil:', error);
+    return res.status(esTimeout ? 504 : 503).json({
+      error: esTimeout ? 'Supabase no respondió a tiempo.' : 'No se pudo consultar el perfil.',
+      code: esTimeout ? 'SUPABASE_TIMEOUT' : undefined,
+    });
+  }
+});
+
+app.put('/api/perfiles', async (req, res) => {
+  const validacion = validarDatosPerfil(req.body);
+  if (validacion.error) {
+    return res.status(400).json({ error: validacion.error });
+  }
+
+  const sesion = await obtenerUsuarioAutenticado(req, res);
+  if (!sesion) return;
+
+  try {
+    const { data, error } = await sesion.client
+      .from('perfiles')
+      .upsert(
+        { id: sesion.user.id, ...validacion.datos },
+        { onConflict: 'id' },
+      )
+      .select('id, nombre_usuario, avatar_url, fecha_registro')
+      .single();
+
+    if (error) return responderErrorSupabase(res, 'reemplazar el perfil', error);
+    return res.json({ data });
+  } catch (error) {
+    const esTimeout = esErrorTimeout(error);
+    console.error('Error reemplazando el perfil:', error);
+    return res.status(esTimeout ? 504 : 503).json({
+      error: esTimeout ? 'Supabase no respondió a tiempo.' : 'No se pudo reemplazar el perfil.',
+      code: esTimeout ? 'SUPABASE_TIMEOUT' : undefined,
+    });
+  }
+});
+
 app.patch('/api/perfiles', async (req, res) => {
   const validacion = validarDatosPerfil(req.body, true);
   if (validacion.error) {
@@ -452,6 +512,33 @@ app.patch('/api/perfiles', async (req, res) => {
     console.error('Error actualizando el perfil:', error);
     return res.status(esTimeout ? 504 : 503).json({
       error: esTimeout ? 'Supabase no respondió a tiempo.' : 'No se pudo actualizar el perfil.',
+      code: esTimeout ? 'SUPABASE_TIMEOUT' : undefined,
+    });
+  }
+});
+
+app.delete('/api/perfiles', async (req, res) => {
+  const sesion = await obtenerUsuarioAutenticado(req, res);
+  if (!sesion) return;
+
+  try {
+    const { data, error } = await sesion.client
+      .from('perfiles')
+      .delete()
+      .eq('id', sesion.user.id)
+      .select('id')
+      .maybeSingle();
+
+    if (error) return responderErrorSupabase(res, 'eliminar el perfil', error);
+    if (!data) {
+      return res.status(404).json({ error: 'No existe un perfil para este usuario.' });
+    }
+    return res.sendStatus(204);
+  } catch (error) {
+    const esTimeout = esErrorTimeout(error);
+    console.error('Error eliminando el perfil:', error);
+    return res.status(esTimeout ? 504 : 503).json({
+      error: esTimeout ? 'Supabase no respondió a tiempo.' : 'No se pudo eliminar el perfil.',
       code: esTimeout ? 'SUPABASE_TIMEOUT' : undefined,
     });
   }
@@ -517,6 +604,205 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-app.listen(port, () => {
+const server = http.createServer(app);
+const chatAdminClient = createAdminClient();
+
+const realtime = attachRealtime(server, {
+  allowedOrigins: corsOrigins,
+  roomClient: chatAdminClient,
+  async authenticate(token) {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error) {
+      if (error.status === 401 || error.status === 403) return null;
+      throw error;
+    }
+    return data.user;
+  },
+});
+
+const chatService = chatAdminClient ? createChatService(chatAdminClient) : null;
+
+function responderErrorChat(res, operacion, error) {
+  if (error?.code) {
+    return responderErrorSupabase(res, operacion, error);
+  }
+
+  const esTimeout = esErrorTimeout(error);
+  console.error(`Error al ${operacion}:`, error);
+  return res.status(esTimeout ? 504 : 503).json({
+    error: esTimeout
+      ? 'Supabase no respondió a tiempo.'
+      : `No se pudo ${operacion}.`,
+    code: esTimeout ? 'SUPABASE_TIMEOUT' : undefined,
+  });
+}
+
+async function obtenerConversacionChat(userId, requestedId) {
+  if (requestedId === null) {
+    const conversation = await chatService.getGeneralConversation();
+    const membership = await chatService.addGeneralMember(conversation.id, userId);
+    return { data: membership.error ? null : conversation, error: membership.error };
+  }
+
+  const result = await chatService.getConversation(requestedId);
+  if (result.error || !result.data) return result;
+
+  const isGeneral = result.data.tipo === 'general' && result.data.partida_id === null;
+  if (isGeneral) {
+    const membership = await chatService.addGeneralMember(result.data.id, userId);
+    if (membership.error) return { data: null, error: membership.error };
+    return result;
+  }
+
+  const membership = await chatService.hasMembership(result.data.id, userId);
+  if (membership.error) return { data: null, error: membership.error };
+  if (!membership.isMember) return { data: null, forbidden: true };
+  return result;
+}
+
+function getRequestedConversationId(req, body) {
+  const rawId = body
+    ? body.conversacion_id ?? body.conversation_id ?? body.conversationId
+    : req.query.conversacion_id ?? req.query.conversation_id ?? req.query.conversationId;
+  return rawId === undefined || rawId === null || rawId === ''
+    ? null
+    : parseConversationId(rawId);
+}
+
+async function obtenerChat(req, res) {
+  const sesion = await obtenerUsuarioAutenticado(req, res);
+  if (!sesion) return;
+
+  if (!chatService) {
+    return res.status(503).json({
+      error: 'El chat requiere configurar SUPABASE_SERVICE_ROLE_KEY en el backend.',
+    });
+  }
+
+  const rawId = getRequestedConversationId(req);
+  const conversationId = rawId === null && (
+    req.query.conversacion_id !== undefined ||
+    req.query.conversation_id !== undefined ||
+    req.query.conversationId !== undefined
+  ) ? null : rawId;
+  if (conversationId === null && (
+    req.query.conversacion_id !== undefined ||
+    req.query.conversation_id !== undefined ||
+    req.query.conversationId !== undefined
+  )) {
+    return res.status(400).json({ error: 'conversacion_id debe ser un entero positivo.' });
+  }
+
+  const limit = Number(req.query.limite ?? req.query.limit ?? 100);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return res.status(400).json({ error: 'El límite debe ser un entero entre 1 y 100.' });
+  }
+
+  try {
+    const conversation = await obtenerConversacionChat(sesion.user.id, conversationId);
+    if (conversation.error) {
+      return responderErrorChat(res, 'consultar la conversación', conversation.error);
+    }
+    if (conversation.forbidden) {
+      return res.status(403).json({ error: 'No perteneces a esta conversación.' });
+    }
+    if (!conversation.data) {
+      return res.status(404).json({ error: 'No existe la conversación solicitada.' });
+    }
+
+    const { data, error } = await chatService.getMessages(conversation.data.id, limit);
+    if (error) return responderErrorChat(res, 'consultar los mensajes', error);
+    return res.json({ data: data.reverse(), conversacion_id: conversation.data.id });
+  } catch (error) {
+    return responderErrorChat(res, 'consultar los mensajes', error);
+  }
+}
+
+async function obtenerUsuariosOnline(req, res) {
+  const sesion = await obtenerUsuarioAutenticado(req, res);
+  if (!sesion) return;
+
+  const users = realtime.getOnlineUsers();
+  return res.json(users);
+}
+
+async function enviarMensajeChat(req, res) {
+  const content = parseMessageContent(req.body);
+  if (!content) {
+    return res.status(400).json({
+      error: 'El mensaje debe tener entre 1 y 500 caracteres.',
+    });
+  }
+
+  const sesion = await obtenerUsuarioAutenticado(req, res);
+  if (!sesion) return;
+
+  if (!chatService) {
+    return res.status(503).json({
+      error: 'El chat requiere configurar SUPABASE_SERVICE_ROLE_KEY en el backend.',
+    });
+  }
+
+  const conversationId = getRequestedConversationId(req, req.body);
+  if (conversationId === null &&
+      (req.body?.conversacion_id !== undefined ||
+       req.body?.conversation_id !== undefined ||
+       req.body?.conversationId !== undefined)) {
+    return res.status(400).json({ error: 'conversacion_id debe ser un entero positivo.' });
+  }
+
+  try {
+    const conversation = await obtenerConversacionChat(sesion.user.id, conversationId);
+    if (conversation.error) {
+      return responderErrorChat(res, 'validar la conversación', conversation.error);
+    }
+    if (conversation.forbidden) {
+      return res.status(403).json({ error: 'No perteneces a esta conversación.' });
+    }
+    if (!conversation.data) {
+      return res.status(404).json({ error: 'No existe la conversación solicitada.' });
+    }
+
+    const { data, error } = await chatService.createMessage(
+      conversation.data.id,
+      sesion.user.id,
+      content,
+    );
+    if (error) return responderErrorChat(res, 'guardar el mensaje', error);
+
+    if (conversation.data.tipo === 'general' && conversation.data.partida_id === null) {
+      realtime.broadcastGeneralMessage({
+        ...data,
+        userId: data.remitente_id,
+        text: data.contenido,
+        createdAt: data.fecha_envio,
+      });
+    }
+
+    return res.status(201).json({ data });
+  } catch (error) {
+    return responderErrorChat(res, 'guardar el mensaje', error);
+  }
+}
+
+app.get(['/chat/messages', '/api/chat/messages', '/api/chat', '/api/chat/general'], obtenerChat);
+app.get(['/chat/online', '/api/chat/online'], obtenerUsuariosOnline);
+app.post(['/chat/messages', '/api/chat/messages', '/api/chat', '/api/chat/general'], enviarMensajeChat);
+
+app.use('/api', (req, res) => {
+  res.status(404).json({ error: `No existe la ruta ${req.method} ${req.path}.` });
+});
+
+app.use((error, _req, res, _next) => {
+  const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600
+    ? error.status
+    : 500;
+  if (status >= 500) console.error('Error procesando la solicitud:', error);
+  return res.status(status).json({
+    error: status === 400 ? 'La solicitud contiene JSON no válido.' : 'No se pudo procesar la solicitud.',
+  });
+});
+
+server.listen(port, () => {
   console.log(`Backend escuchando en el puerto ${port}`);
 });
