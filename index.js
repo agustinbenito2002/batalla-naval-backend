@@ -1,5 +1,7 @@
 const path = require('node:path');
+const fs = require('node:fs');
 const http = require('node:http');
+const https = require('node:https');
 const express = require('express');
 const dotenv = require('dotenv');
 
@@ -10,7 +12,12 @@ if (envError) {
 
 const { supabase, createAdminClient, createUserClient } = require('./db');
 const { attachRealtime } = require('./realtime');
-const { createChatService, parseConversationId, parseMessageContent } = require('./chat');
+const {
+  createChatService,
+  formatChatMessage,
+  parseConversationId,
+  parseMessageContent,
+} = require('./chat');
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
@@ -18,14 +25,15 @@ const port = Number(process.env.PORT) || 3000;
 app.use(express.json());
 app.locals.supabase = supabase;
 
-const localDevelopmentOrigins = process.env.NODE_ENV === 'production'
-  ? []
-  : ['http://localhost:5173', 'http://127.0.0.1:5173'];
+const localDevelopmentOrigins = ['http://localhost:5173', 'http://127.0.0.1:5173'];
 const configuredCorsOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map((origin) => origin.trim())
   .filter(Boolean);
-const corsOrigins = new Set([...localDevelopmentOrigins, ...configuredCorsOrigins]);
+const corsOrigins = new Set(
+  [...localDevelopmentOrigins, ...configuredCorsOrigins]
+    .map((origin) => origin.replace(/\/+$/, '')),
+);
 
 app.use((req, res, next) => {
   const origin = req.get('origin');
@@ -604,7 +612,18 @@ app.get('/health', async (_req, res) => {
   }
 });
 
-const server = http.createServer(app);
+const tlsKeyPath = process.env.TLS_KEY_PATH?.trim();
+const tlsCertPath = process.env.TLS_CERT_PATH?.trim();
+if (Boolean(tlsKeyPath) !== Boolean(tlsCertPath)) {
+  throw new Error('Configura TLS_KEY_PATH y TLS_CERT_PATH juntos, o deja ambos sin configurar.');
+}
+
+const server = tlsKeyPath
+  ? https.createServer({
+    key: fs.readFileSync(path.resolve(__dirname, tlsKeyPath)),
+    cert: fs.readFileSync(path.resolve(__dirname, tlsCertPath)),
+  }, app)
+  : http.createServer(app);
 const chatAdminClient = createAdminClient();
 
 const realtime = attachRealtime(server, {
@@ -712,18 +731,29 @@ async function obtenerChat(req, res) {
 
     const { data, error } = await chatService.getMessages(conversation.data.id, limit);
     if (error) return responderErrorChat(res, 'consultar los mensajes', error);
-    return res.json({ data: data.reverse(), conversacion_id: conversation.data.id });
+    const senderIds = [...new Set(data
+      .map((message) => message.remitente_id)
+      .filter((id) => typeof id === 'string'))];
+    const { data: profiles, error: profileError } = await chatService.getProfiles(senderIds);
+    if (profileError) return responderErrorChat(res, 'consultar los remitentes del chat', profileError);
+    const usernames = new Map((profiles || []).map((profile) => [profile.id, profile.nombre_usuario]));
+    const messages = data
+      .reverse()
+      .map((message) => formatChatMessage(message, usernames.get(message.remitente_id)));
+    res.set('X-Conversation-Id', String(conversation.data.id));
+    return res.json(messages);
   } catch (error) {
     return responderErrorChat(res, 'consultar los mensajes', error);
   }
 }
 
 async function obtenerUsuariosOnline(req, res) {
-  const sesion = await obtenerUsuarioAutenticado(req, res);
-  if (!sesion) return;
-
   const users = realtime.getOnlineUsers();
   return res.json(users);
+}
+
+async function diagnosticarUsuariosOnline(req, res) {
+  return res.json(realtime.getPresenceDiagnostics());
 }
 
 async function enviarMensajeChat(req, res) {
@@ -770,16 +800,19 @@ async function enviarMensajeChat(req, res) {
     );
     if (error) return responderErrorChat(res, 'guardar el mensaje', error);
 
+    const { data: profile, error: profileError } = await chatService.getProfiles([sesion.user.id]);
+    if (profileError) return responderErrorChat(res, 'consultar el remitente del mensaje', profileError);
+    const username = profile?.[0]?.nombre_usuario ||
+      sesion.user.user_metadata?.nombre_usuario ||
+      sesion.user.user_metadata?.username ||
+      `Jugador-${sesion.user.id.slice(0, 8)}`;
+    const formattedMessage = formatChatMessage(data, username);
+
     if (conversation.data.tipo === 'general' && conversation.data.partida_id === null) {
-      realtime.broadcastGeneralMessage({
-        ...data,
-        userId: data.remitente_id,
-        text: data.contenido,
-        createdAt: data.fecha_envio,
-      });
+      realtime.broadcastGeneralMessage(formattedMessage);
     }
 
-    return res.status(201).json({ data });
+    return res.status(201).json({ data: formattedMessage });
   } catch (error) {
     return responderErrorChat(res, 'guardar el mensaje', error);
   }
@@ -787,6 +820,7 @@ async function enviarMensajeChat(req, res) {
 
 app.get(['/chat/messages', '/api/chat/messages', '/api/chat', '/api/chat/general'], obtenerChat);
 app.get(['/chat/online', '/api/chat/online'], obtenerUsuariosOnline);
+app.get(['/chat/online/status', '/api/chat/online/status'], diagnosticarUsuariosOnline);
 app.post(['/chat/messages', '/api/chat/messages', '/api/chat', '/api/chat/general'], enviarMensajeChat);
 
 app.use('/api', (req, res) => {
@@ -804,5 +838,5 @@ app.use((error, _req, res, _next) => {
 });
 
 server.listen(port, () => {
-  console.log(`Backend escuchando en el puerto ${port}`);
+  console.log(`Backend escuchando por ${tlsKeyPath ? 'HTTPS/WSS' : 'HTTP/WS'} en el puerto ${port}`);
 });

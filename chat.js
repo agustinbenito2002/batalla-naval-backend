@@ -13,6 +13,30 @@ function parseMessageContent(body) {
   return value.trim();
 }
 
+function formatChatMessage(message, username) {
+  const senderId = message.remitente_id ?? message.userId ?? message.user_id ?? message.sender_id;
+  const text = message.contenido ?? message.text ?? message.content ?? message.message;
+  const senderName = username || message.username || message.sender || senderId;
+
+  return {
+    ...message,
+    remitente_id: senderId,
+    user_id: senderId,
+    userId: senderId,
+    sender_id: senderId,
+    senderId,
+    remitente: senderName,
+    sender: senderName,
+    username: senderName,
+    contenido: text,
+    text,
+    content: text,
+    message: text,
+    fecha_envio: message.fecha_envio ?? message.createdAt,
+    createdAt: message.createdAt ?? message.fecha_envio,
+  };
+}
+
 function createChatService(adminClient) {
   let generalConversationPromise;
 
@@ -77,6 +101,13 @@ function createChatService(adminClient) {
     getConversation,
     hasMembership,
     addGeneralMember,
+    getProfiles(userIds) {
+      if (userIds.length === 0) return Promise.resolve({ data: [], error: null });
+      return adminClient
+        .from('perfiles')
+        .select('id, nombre_usuario')
+        .in('id', userIds);
+    },
     getMessages(conversationId, limit = 100) {
       return adminClient
         .from('mensajes')
@@ -99,4 +130,9 @@ function createChatService(adminClient) {
   };
 }
 
-module.exports = { createChatService, parseConversationId, parseMessageContent };
+module.exports = {
+  createChatService,
+  formatChatMessage,
+  parseConversationId,
+  parseMessageContent,
+};

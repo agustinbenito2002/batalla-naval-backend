@@ -23,7 +23,7 @@ function createSharedRoomTransport() {
           const listeners = [];
           const channel = {
             topic,
-            key: options.config.presence.key,
+            key: options.config.presence?.key || topic,
             subscribed: false,
             presence: null,
             on(type, filter, callback) {
@@ -275,13 +275,21 @@ test('rejects invalid tokens and disallowed browser origins', async (t) => {
   const disallowed = new WebSocket(`ws://127.0.0.1:${server.address().port}/ws`, {
     headers: { Origin: 'https://untrusted.example' },
   });
-  await assert.rejects(once(disallowed, 'open'));
+  const rejectedResponse = new Promise((resolve, reject) => {
+    disallowed.once('unexpected-response', (_request, response) => {
+      response.resume();
+      resolve(response.statusCode);
+    });
+    disallowed.once('error', reject);
+  });
+  assert.equal(await rejectedResponse, 403);
 });
 
 test('shares the global room presence and chat across backend instances', async (t) => {
   const transport = createSharedRoomTransport();
   const serverA = http.createServer();
   const serverB = http.createServer();
+  const serverC = http.createServer();
   const options = {
     allowedOrigins: new Set(['http://localhost:5173']),
     authenticate: async (token) => ({
@@ -297,15 +305,25 @@ test('shares the global room presence and chat across backend instances', async 
     ...options,
     roomClient: transport.createClient(),
   });
+  const realtimeC = attachRealtime(serverC, {
+    ...options,
+    roomClient: transport.createClient(),
+  });
   const sockets = [];
   serverA.listen(0);
   serverB.listen(0);
-  await Promise.all([once(serverA, 'listening'), once(serverB, 'listening')]);
+  serverC.listen(0);
+  await Promise.all([
+    once(serverA, 'listening'),
+    once(serverB, 'listening'),
+    once(serverC, 'listening'),
+  ]);
   t.after(async () => {
-    await Promise.all([realtimeA.close(), realtimeB.close()]);
+    await Promise.all([realtimeA.close(), realtimeB.close(), realtimeC.close()]);
     await Promise.all([
       new Promise((resolve) => serverA.close(resolve)),
       new Promise((resolve) => serverB.close(resolve)),
+      new Promise((resolve) => serverC.close(resolve)),
     ]);
     for (const socket of sockets) {
       if (socket.readyState === WebSocket.OPEN) socket.terminate();
@@ -314,7 +332,8 @@ test('shares the global room presence and chat across backend instances', async 
 
   const alice = await connect(serverA.address().port);
   const bob = await connect(serverB.address().port);
-  sockets.push(alice, bob);
+  const charlie = await connect(serverC.address().port);
+  sockets.push(alice, bob, charlie);
   const alicePresence = waitForEvent(
     alice,
     'chat:presence',
@@ -330,10 +349,30 @@ test('shares the global room presence and chat across backend instances', async 
   );
   await authenticate(bob, 'bob');
   await Promise.all([alicePresence, bobPresence]);
+  const aliceSeesCharlie = waitForEvent(
+    alice,
+    'chat:presence',
+    (event) => event.users.some((user) => user.id === 'charlie'),
+  );
+  const bobSeesCharlie = waitForEvent(
+    bob,
+    'chat:presence',
+    (event) => event.users.some((user) => user.id === 'charlie'),
+  );
+  await authenticate(charlie, 'charlie');
+  await Promise.all([aliceSeesCharlie, bobSeesCharlie]);
   assert.deepEqual(
     realtimeA.getOnlineUsers().map((user) => user.id).sort(),
-    ['alice', 'bob'],
+    ['alice', 'bob', 'charlie'],
   );
+  assert.deepEqual(realtimeA.getPresenceDiagnostics(), {
+    room: 'chat:general',
+    realtime: 'SUBSCRIBED',
+    privateRealtime: 'SUBSCRIBED',
+    localUsers: 1,
+    remoteUsers: 2,
+    onlineUsers: 3,
+  });
 
   const messageOnBob = waitForEvent(
     bob,
@@ -346,4 +385,49 @@ test('shares the global room presence and chat across backend instances', async 
     text: 'Hola desde otra instancia',
   }));
   assert.equal((await messageOnBob).message.userId, 'alice');
+
+  const privateOnAlice = waitForEvent(
+    alice,
+    'chat:private:message',
+    (event) => event.message.text === 'Solo para Bob',
+  );
+  const privateOnBob = waitForEvent(
+    bob,
+    'chat:private:message',
+    (event) => event.message.text === 'Solo para Bob',
+  );
+  let privateLeakedToCharlie = false;
+  let publicLeakedToCharlie = false;
+  const observeCharlie = (raw) => {
+    const event = JSON.parse(raw.toString());
+    if (event.type === 'chat:private:message') privateLeakedToCharlie = true;
+    if (event.type === 'chat:message' && event.message?.text === 'Solo para Bob') {
+      publicLeakedToCharlie = true;
+    }
+  };
+  charlie.on('message', observeCharlie);
+  alice.send(JSON.stringify({
+    type: 'chat:private:send',
+    recipientId: 'bob',
+    text: 'Solo para Bob',
+  }));
+  const [aliceEvent, bobEvent] = await Promise.all([privateOnAlice, privateOnBob]);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  charlie.removeListener('message', observeCharlie);
+  assert.equal(aliceEvent.recipientId, 'bob');
+  assert.equal(bobEvent.senderId, 'alice');
+  assert.equal(privateLeakedToCharlie, false);
+  assert.equal(publicLeakedToCharlie, false);
+
+  const offlineError = waitForEvent(
+    alice,
+    'error',
+    (event) => event.code === 'RECIPIENT_OFFLINE',
+  );
+  alice.send(JSON.stringify({
+    type: 'chat:private:send',
+    recipientId: 'offline-user',
+    text: 'No debe entregarse',
+  }));
+  await offlineError;
 });

@@ -1,5 +1,6 @@
 const { randomUUID } = require('node:crypto');
 const { WebSocket, WebSocketServer } = require('ws');
+const { formatChatMessage } = require('./chat');
 
 const MAX_MESSAGE_BYTES = 16 * 1024;
 const MAX_CHAT_LENGTH = 500;
@@ -7,7 +8,12 @@ const MAX_CHAT_HISTORY = 50;
 const MAX_MATCHES = 500;
 const MATCH_TTL_MS = 2 * 60 * 60 * 1000;
 
-function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
+function attachRealtime(server, {
+  authenticate,
+  allowedOrigins,
+  roomClient,
+  roomName = 'chat:general',
+}) {
   const wss = new WebSocketServer({
     noServer: true,
     maxPayload: MAX_MESSAGE_BYTES,
@@ -20,6 +26,10 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
   const remoteUsers = new Map();
   let roomChannel;
   let roomReady = false;
+  let roomStatus = roomClient ? 'CONNECTING' : 'DISABLED';
+  let privateChannel;
+  let privateRoomReady = false;
+  let privateRoomStatus = roomClient ? 'CONNECTING' : 'DISABLED';
   let presenceUpdates = Promise.resolve();
 
   function send(socket, message) {
@@ -115,8 +125,98 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
     });
   }
 
+  function relayPrivateMessage(message) {
+    if (!privateChannel || !privateRoomReady) {
+      return false;
+    }
+
+    privateChannel.send({
+      type: 'broadcast',
+      event: 'private-chat-message',
+      payload: { message },
+    }).then((status) => {
+      if (status !== 'ok') {
+        console.error(`Supabase Realtime no pudo retransmitir el mensaje privado: ${status}.`);
+      }
+    }).catch((error) => {
+      console.error('Error retransmitiendo mensaje privado entre instancias:', error);
+    });
+    return true;
+  }
+
+  function deliverPrivateMessage(message) {
+    const recipients = new Set([message.senderId, message.recipientId]);
+    for (const userId of recipients) {
+      const connection = connections.get(userId);
+      if (connection) {
+        send(connection, {
+          type: 'chat:private:message',
+          scope: 'private',
+          conversationId: message.conversationId,
+          senderId: message.senderId,
+          recipientId: message.recipientId,
+          message,
+        });
+      }
+    }
+  }
+
+  function sendPrivateMessage(socket, message) {
+    const recipientId = message.recipientId ??
+      message.recipient_id ??
+      message.toUserId ??
+      message.to_user_id ??
+      message.to;
+    const text = message.text ?? message.contenido ?? message.content ?? message.message;
+    if (typeof recipientId !== 'string' || !recipientId.trim() || recipientId.length > 128) {
+      sendError(socket, 'recipientId debe identificar al destinatario.', 'INVALID_RECIPIENT');
+      return;
+    }
+    if (recipientId === socket.user.id) {
+      sendError(socket, 'No puedes enviarte un mensaje privado.', 'INVALID_RECIPIENT');
+      return;
+    }
+    if (typeof text !== 'string' || !text.trim() || text.trim().length > MAX_CHAT_LENGTH) {
+      sendError(socket, `text debe tener entre 1 y ${MAX_CHAT_LENGTH} caracteres.`, 'INVALID_MESSAGE');
+      return;
+    }
+
+    const localRecipient = connections.get(recipientId);
+    const recipient = localRecipient?.readyState === WebSocket.OPEN
+      ? localRecipient.user
+      : remoteUsers.get(recipientId);
+    if (!recipient) {
+      sendError(socket, 'El destinatario no está conectado al chat.', 'RECIPIENT_OFFLINE');
+      return;
+    }
+
+    if (localRecipient?.readyState !== WebSocket.OPEN && !privateRoomReady) {
+      sendError(socket, 'La sala privada entre servidores no está disponible.', 'PRIVATE_CHAT_UNAVAILABLE');
+      return;
+    }
+
+    const privateMessage = {
+      id: randomUUID(),
+      senderId: socket.user.id,
+      sender_id: socket.user.id,
+      sender: socket.user.username,
+      senderUsername: socket.user.username,
+      recipientId,
+      recipient_id: recipientId,
+      recipientUsername: recipient?.username,
+      text: text.trim(),
+      contenido: text.trim(),
+      createdAt: new Date().toISOString(),
+    };
+
+    deliverPrivateMessage(privateMessage);
+    if (localRecipient?.readyState !== WebSocket.OPEN) {
+      relayPrivateMessage(privateMessage);
+    }
+  }
+
   if (roomClient) {
-    roomChannel = roomClient.channel('chat:general', {
+    roomChannel = roomClient.channel(roomName, {
       config: {
         presence: { key: instanceId },
         broadcast: { self: false },
@@ -130,6 +230,7 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
         }
       })
       .subscribe((status, error) => {
+        roomStatus = status;
         if (status === 'SUBSCRIBED') {
           roomReady = true;
           syncRoomPresence();
@@ -141,6 +242,29 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
           console.error(`No se pudo conectar a la sala global de Supabase Realtime: ${status}.`, error);
         }
         if (status === 'CLOSED') roomReady = false;
+      });
+
+    privateChannel = roomClient.channel('chat:private', {
+      config: {
+        private: true,
+        broadcast: { self: false },
+      },
+    });
+    privateChannel
+      .on('broadcast', { event: 'private-chat-message' }, ({ payload }) => {
+        const message = payload?.message;
+        if (message &&
+            typeof message.senderId === 'string' &&
+            typeof message.recipientId === 'string') {
+          deliverPrivateMessage(message);
+        }
+      })
+      .subscribe((status, error) => {
+        privateRoomStatus = status;
+        privateRoomReady = status === 'SUBSCRIBED';
+        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          console.error(`No se pudo conectar a la sala privada de Supabase Realtime: ${status}.`, error);
+        }
       });
   }
 
@@ -327,13 +451,13 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
   }
 
   function publishChat(socket, scope, text, match) {
-    const message = {
+    const message = formatChatMessage({
       id: randomUUID(),
       userId: socket.user.id,
       username: socket.user.username,
       text: text.trim(),
       createdAt: new Date().toISOString(),
-    };
+    }, socket.user.username);
     const event = {
       type: 'chat:message',
       scope,
@@ -352,13 +476,13 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
   }
 
   function publishGeneralMessage(user, text, existingMessage) {
-    const message = existingMessage || {
+    const message = formatChatMessage(existingMessage || {
       id: randomUUID(),
       userId: user.id,
       username: user.username,
       text: text.trim(),
       createdAt: new Date().toISOString(),
-    };
+    }, user.username);
     deliverGeneralMessage(message);
     relayGeneralMessage(message);
     return message;
@@ -391,7 +515,8 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
       return;
     }
 
-    const isChat = message.type === 'chat:send';
+    const isChat = message.type === 'chat:send' ||
+      message.type === 'chat:private:send';
     if (!rateLimit(socket, isChat)) return;
 
     switch (message.type) {
@@ -568,6 +693,10 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
         break;
       }
 
+      case 'chat:private:send':
+        sendPrivateMessage(socket, message);
+        break;
+
       default:
         sendError(socket, `Tipo de mensaje no reconocido: ${message.type}.`, 'UNKNOWN_MESSAGE_TYPE');
     }
@@ -588,8 +717,16 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
     }
     const origin = request.headers.origin;
     if (origin && !allowedOrigins.has(origin)) {
-      socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
-      socket.destroy();
+      console.error(`Conexión WebSocket rechazada: el origen "${origin}" no está incluido en CORS_ORIGINS.`);
+      const body = 'WebSocket origin is not allowed by CORS.';
+      socket.end(
+        'HTTP/1.1 403 Forbidden\r\n' +
+        'Connection: close\r\n' +
+        'Content-Type: text/plain; charset=utf-8\r\n' +
+        `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+        '\r\n' +
+        body,
+      );
       return;
     }
 
@@ -631,11 +768,26 @@ function attachRealtime(server, { authenticate, allowedOrigins, roomClient }) {
       return generalHistory.slice(-limit);
     },
     getOnlineUsers,
+    getPresenceDiagnostics() {
+      return {
+        room: roomName,
+        realtime: roomStatus,
+        privateRealtime: privateRoomStatus,
+        localUsers: getLocalOnlineUsers().length,
+        remoteUsers: remoteUsers.size,
+        onlineUsers: getOnlineUsers().length,
+      };
+    },
     closeRoom() {
       roomReady = false;
-      if (!roomChannel) return Promise.resolve();
-      return roomClient.removeChannel(roomChannel).then(() => {
+      roomStatus = 'CLOSED';
+      privateRoomReady = false;
+      privateRoomStatus = 'CLOSED';
+      const channels = [roomChannel, privateChannel].filter(Boolean);
+      if (channels.length === 0) return Promise.resolve();
+      return Promise.all(channels.map((channel) => roomClient.removeChannel(channel))).then(() => {
         roomChannel = null;
+        privateChannel = null;
         remoteUsers.clear();
       });
     },
