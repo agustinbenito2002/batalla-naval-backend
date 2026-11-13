@@ -116,6 +116,13 @@ function createChatService(adminClient) {
         .order('fecha_envio', { ascending: false })
         .limit(limit);
     },
+    deleteExpiredGeneralMessages(conversationId, cutoff) {
+      return adminClient
+        .from('mensajes')
+        .delete()
+        .eq('conversacion_id', conversationId)
+        .lt('fecha_envio', cutoff || new Date(Date.now() - 60 * 60 * 1000).toISOString());
+    },
     createMessage(conversationId, userId, content) {
       return adminClient
         .from('mensajes')

@@ -10,7 +10,9 @@ al reiniciar el proceso ni se comparten entre varias instancias del backend.
 Todos los clientes del chat general se unen a la sala global `chat:general`.
 Su presencia y mensajes se sincronizan entre instancias del backend mediante
 Supabase Realtime; los mensajes enviados por HTTP se persisten en las tablas
-`conversaciones`, `miembros_conversacion` y `mensajes` de Supabase.
+`conversaciones`, `miembros_conversacion` y `mensajes` de Supabase durante una
+hora. Los mensajes vencidos se eliminan periódicamente y al consultar o enviar
+mensajes en el chat general.
 
 ## Chat general por HTTP
 
@@ -99,8 +101,11 @@ origen rechazado en la terminal.
 
 La conexión debe proceder de un origen incluido en `CORS_ORIGINS` (en
 desarrollo también se permiten los orígenes locales configurados por el
-backend). El servidor valida el token contra Supabase. Solo se permite una
-conexión activa por usuario; una conexión nueva reemplaza la anterior.
+backend). El cliente debe enviar el mensaje `auth` en los primeros cinco
+segundos. Desde que lo recibe, el servidor puede tardar hasta 20 segundos en
+validar el token contra Supabase; si se supera ese plazo, envía el error
+`AUTHENTICATION_TIMEOUT` y cierra la conexión. Solo se permite una conexión
+activa por usuario; una conexión nueva reemplaza la anterior.
 Al autenticarse, el servidor envía `chat:presence` con la lista de usuarios
 conectados y vuelve a transmitirla cuando alguien se conecta o desconecta.
 La presencia es en memoria, solo incluye usuarios conectados por WebSocket a
@@ -120,13 +125,40 @@ Todos los mensajes son objetos JSON con un campo `type`.
 | `match:join` | `matchId` | Se une como jugador a una partida disponible; el segundo jugador la inicia. |
 | `match:spectate` | `matchId` | Se une como espectador, sin permiso para enviar acciones del juego. |
 | `match:leave` | `matchId` | Sale de la partida; si sale un jugador, la partida termina. |
-| `match:action` | `matchId`, `action` (objeto JSON) | Retransmite la acción de un jugador al resto de la sala. |
+| `game:challenge:invite` | `recipientId` (ID o nombre de usuario) | Crea una partida privada e invita al usuario conectado. |
+| `game:challenge:respond` | `matchId`, `accepted` (booleano) | Acepta o rechaza una invitación privada. Solo el usuario invitado puede responder. |
+| `match:action` | `matchId`, `action` (objeto JSON) | Procesa la flota tipada, ataques y radar; valida munición y turnos, y retransmite los resultados. |
 | `chat:send` | `scope` (`general` o `match`), `text`; `matchId` para `match` | Envía un mensaje al chat general o al chat de la partida actual. |
-| `chat:private:send` | `recipientId` (o `recipient_id`), `text` | Envía un mensaje privado únicamente al emisor y al destinatario conectados. También acepta `toUserId`, `to_user_id`, `to` y los campos de texto `contenido`, `content` o `message`. El destinatario debe estar en línea; de lo contrario devuelve el error `RECIPIENT_OFFLINE`. |
+| `chat:private:send` | `recipientId` (o `recipient_id`), `text` | Envía un mensaje privado únicamente al emisor y al destinatario conectados. El destinatario puede identificarse por ID o nombre de usuario; también acepta `recipient` (ID, nombre u objeto con `id`), `toUserId`, `to_user_id`, `to` y los campos de texto `contenido`, `content` o `message`. El destinatario debe estar en línea; de lo contrario devuelve el error `RECIPIENT_OFFLINE`. |
 
-El backend retransmite acciones y no implementa ni valida las reglas de
-Batalla Naval, los turnos o el tablero. La página debe interpretar las
-acciones y aplicar las reglas del juego.
+Los mensajes privados no se guardan en Supabase ni en el historial del servidor.
+El cliente debe mantenerlos solo en el estado de la pestaña de chat privado y
+descartarlos al cerrarla. Cada partida mantiene su propio historial en memoria
+(hasta 50 mensajes); solo pueden leerlo y escribir quienes se hayan unido a esa
+partida como jugador o espectador. Los mensajes de una partida nunca se envían
+al chat general ni a otras partidas. Los mensajes generales se conservan como
+máximo una hora.
+
+`fleet:ready` debe enviar cinco objetos `{ type, cells }`, uno de cada tipo:
+`seriousGirl` (2 casillas), `vanguard` (3), `coordinator` (3), `battleship` (4)
+y `carrier` (4). Las naves deben ser rectas, contiguas y no superponerse.
+
+Al comenzar, cada jugador recibe 5 municiones `cross`, 2 `bombardment` y 1
+`radar`; el ataque `normal` es ilimitado. El portaaviones intacto agrega una
+munición de cada tipo y pierde las que queden cuando recibe su primer impacto.
+El ataque en cruz alcanza cinco casillas, el bombardeo usa el patrón 5×5
+existente y el radar revela las naves en una cruz de siete casillas (cinco
+verticales y tres horizontales, compartiendo el centro). El radar no causa daño,
+no detecta a la Chica seria, consume la acción principal y termina el turno.
+Solo el jugador que lo usó recibe `match:radar:result`.
+
+El servidor sortea al azar quién empieza cuando ambas flotas están listas. La
+Coordinadora concede un ataque normal adicional en el turno mientras quede al
+menos una de sus tres casillas sin impacto. El Acorazado necesita dos impactos
+en cada casilla; la Vanguardia intercepta el primer impacto que recibe; la
+Chica seria evade el bombardeo. El servidor calcula impactos, hundimientos,
+munición y victoria, y rechaza ataques fuera de turno, munición agotada y
+repeticiones que no sean el segundo impacto de una casilla del Acorazado.
 
 ## Eventos del servidor
 
@@ -144,12 +176,28 @@ acciones y aplicar las reglas del juego.
 - `match:joined` / `match:spectating`: confirma el ingreso e incluye `match`
   y los últimos mensajes de esa partida.
 - `match:updated`: estado y jugadores actuales de la partida.
-- `match:action`: acción retransmitida con `playerId`, `username` y `sentAt`.
+- `game:challenge:sent`: confirma al emisor que se envió el desafío e incluye
+  `matchId` y destinatario.
+- `game:challenge:invite`: invitación dirigida al destinatario, con `matchId`
+  y datos del emisor dentro de `invitation`.
+- `game:challenge:accepted` / `game:challenge:declined`: resultado del desafío;
+  el rechazo puede incluir `reason` (`recipient_offline`, `expired` o
+  `cancelled`).
+- `match:action`: acción procesada con `actionId`, `playerId`, `username`,
+  `sentAt` y estado público `game`; ataques también incluyen `results` y
+  `winnerId` dentro de `action`. `game.ammo` contiene solo la munición del
+  usuario que recibe el evento.
+- `match:radar:result`: resultado privado del radar, con las casillas
+  `{ cell, detected }`; solo lo recibe quien usó el radar.
 - `match:ended`: partida finalizada, por ejemplo cuando un jugador sale.
 - `pong`: respuesta al mensaje `ping`.
 
 El objeto `match` incluye `id`, `visibility`, `status` (`waiting` o `playing`),
 `players` (con estado `online`), cantidad de `spectators`, `yourRole` y
-`createdAt`. Los mensajes de chat admiten hasta 500 caracteres. Los marcos
-WebSocket están limitados a 16 KiB y las conexiones se limitan para evitar
-envíos excesivos.
+`createdAt`. También contiene `game` (`phase`, `currentTurnId`, `turnNumber`,
+`winnerId`, `readyPlayerIds`, `primaryActionAvailable`, `extraNormalAvailable`
+y la munición del receptor); nunca incluye la posición ni el daño detallado de
+las flotas. Las partidas siguen en memoria y solo pueden emparejar usuarios
+conectados a la misma instancia del backend. Los mensajes de chat admiten hasta
+500 caracteres. Los marcos WebSocket están limitados a 16 KiB y las conexiones
+se limitan para evitar envíos excesivos.

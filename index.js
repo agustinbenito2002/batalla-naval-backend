@@ -641,6 +641,29 @@ const realtime = attachRealtime(server, {
 
 const chatService = chatAdminClient ? createChatService(chatAdminClient) : null;
 
+async function limpiarMensajesChatGeneral() {
+  if (!chatService) return;
+
+  try {
+    const conversation = await chatService.getGeneralConversation();
+    const { error } = await chatService.deleteExpiredGeneralMessages(conversation.id);
+    if (error) {
+      console.error('No se pudieron eliminar los mensajes vencidos del chat general:', error);
+    }
+  } catch (error) {
+    console.error('No se pudieron eliminar los mensajes vencidos del chat general:', error);
+  }
+}
+
+const chatCleanupTimer = chatService
+  ? setInterval(limpiarMensajesChatGeneral, 60 * 1000)
+  : null;
+if (chatCleanupTimer) {
+  chatCleanupTimer.unref();
+  server.once('close', () => clearInterval(chatCleanupTimer));
+  void limpiarMensajesChatGeneral();
+}
+
 function responderErrorChat(res, operacion, error) {
   if (error?.code) {
     return responderErrorSupabase(res, operacion, error);
@@ -729,6 +752,11 @@ async function obtenerChat(req, res) {
       return res.status(404).json({ error: 'No existe la conversación solicitada.' });
     }
 
+    if (conversation.data.tipo === 'general' && conversation.data.partida_id === null) {
+      const { error } = await chatService.deleteExpiredGeneralMessages(conversation.data.id);
+      if (error) return responderErrorChat(res, 'eliminar mensajes vencidos del chat general', error);
+    }
+
     const { data, error } = await chatService.getMessages(conversation.data.id, limit);
     if (error) return responderErrorChat(res, 'consultar los mensajes', error);
     const senderIds = [...new Set(data
@@ -791,6 +819,11 @@ async function enviarMensajeChat(req, res) {
     }
     if (!conversation.data) {
       return res.status(404).json({ error: 'No existe la conversación solicitada.' });
+    }
+
+    if (conversation.data.tipo === 'general' && conversation.data.partida_id === null) {
+      const { error } = await chatService.deleteExpiredGeneralMessages(conversation.data.id);
+      if (error) return responderErrorChat(res, 'eliminar mensajes vencidos del chat general', error);
     }
 
     const { data, error } = await chatService.createMessage(

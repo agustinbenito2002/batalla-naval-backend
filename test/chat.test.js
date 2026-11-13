@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
+  createChatService,
   formatChatMessage,
   parseConversationId,
   parseMessageContent,
@@ -43,4 +44,38 @@ test('formats database messages with sender and text fields for chat clients', (
   assert.equal(formatted.content, 'Hola');
   assert.equal(formatted.message, 'Hola');
   assert.equal(formatted.contenido, 'Hola');
+});
+
+test('deletes only general chat messages older than the one-hour cutoff', async () => {
+  const expectedCutoff = '2026-11-06T12:00:00.000Z';
+  const query = {};
+  const adminClient = {
+    from(table) {
+      assert.equal(table, 'mensajes');
+      return {
+        delete() {
+          return {
+            eq(column, value) {
+              query.conversation = [column, value];
+              return {
+                lt(timestampColumn, cutoff) {
+                  query.timestamp = [timestampColumn, cutoff];
+                  return Promise.resolve({ error: null });
+                },
+              };
+            },
+          };
+        },
+      };
+    },
+  };
+
+  const service = createChatService(adminClient);
+  const result = await service.deleteExpiredGeneralMessages(42, expectedCutoff);
+
+  assert.deepEqual(result, { error: null });
+  assert.deepEqual(query, {
+    conversation: ['conversacion_id', 42],
+    timestamp: ['fecha_envio', expectedCutoff],
+  });
 });
