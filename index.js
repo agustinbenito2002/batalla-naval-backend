@@ -21,6 +21,8 @@ const {
 
 const app = express();
 const port = Number(process.env.PORT) || 3000;
+const CHAT_CLEANUP_INTERVAL_MS = 60 * 1000;
+const CHAT_CLEANUP_MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
 
 app.use(express.json());
 app.locals.supabase = supabase;
@@ -640,23 +642,42 @@ const realtime = attachRealtime(server, {
 });
 
 const chatService = chatAdminClient ? createChatService(chatAdminClient) : null;
+let chatCleanupInProgress = false;
+let chatCleanupFailures = 0;
+let nextChatCleanupAt = 0;
 
 async function limpiarMensajesChatGeneral() {
-  if (!chatService) return;
+  if (!chatService || chatCleanupInProgress || Date.now() < nextChatCleanupAt) return;
 
+  chatCleanupInProgress = true;
   try {
     const conversation = await chatService.getGeneralConversation();
     const { error } = await chatService.deleteExpiredGeneralMessages(conversation.id);
-    if (error) {
-      console.error('No se pudieron eliminar los mensajes vencidos del chat general:', error);
+    if (error) throw error;
+
+    if (chatCleanupFailures > 0) {
+      console.info('Se reanudó la limpieza de mensajes vencidos del chat general.');
     }
+    chatCleanupFailures = 0;
+    nextChatCleanupAt = 0;
   } catch (error) {
-    console.error('No se pudieron eliminar los mensajes vencidos del chat general:', error);
+    chatCleanupFailures += 1;
+    const retryDelay = Math.min(
+      CHAT_CLEANUP_INTERVAL_MS * (2 ** Math.min(chatCleanupFailures - 1, 3)),
+      CHAT_CLEANUP_MAX_RETRY_DELAY_MS,
+    );
+    nextChatCleanupAt = Date.now() + retryDelay;
+    console.error(
+      `No se pudieron eliminar los mensajes vencidos del chat general. Se reintentará en ${Math.ceil(retryDelay / 1000)} segundos:`,
+      error,
+    );
+  } finally {
+    chatCleanupInProgress = false;
   }
 }
 
 const chatCleanupTimer = chatService
-  ? setInterval(limpiarMensajesChatGeneral, 60 * 1000)
+  ? setInterval(limpiarMensajesChatGeneral, CHAT_CLEANUP_INTERVAL_MS)
   : null;
 if (chatCleanupTimer) {
   chatCleanupTimer.unref();

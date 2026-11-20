@@ -11,7 +11,7 @@ const MATCH_TTL_MS = 2 * 60 * 60 * 1000;
 const BOARD_SIZE = 15;
 const BOARD_CELLS = BOARD_SIZE * BOARD_SIZE;
 const AUTH_MESSAGE_TIMEOUT_MS = 5000;
-const AUTH_VALIDATION_TIMEOUT_MS = 20000;
+const AUTH_VALIDATION_TIMEOUT_MS = 55000;
 const AUTH_RETRY_DELAY_MS = 500;
 const SHIP_LENGTHS = Object.freeze({
   seriousGirl: 2,
@@ -366,7 +366,7 @@ function attachRealtime(server, {
       game: {
         phase: 'placing',
         fleets: new Map(),
-        attackedCells: new Map(),
+        attackCenters: new Map(),
         ammo: new Map(),
         currentTurnId: null,
         turnNumber: 0,
@@ -432,18 +432,19 @@ function attachRealtime(server, {
     const centerRow = Math.floor(center / BOARD_SIZE);
     const centerColumn = center % BOARD_SIZE;
     const targets = [];
-    for (let rowOffset = -2; rowOffset <= 2; rowOffset += 1) {
-      for (let columnOffset = -2; columnOffset <= 2; columnOffset += 1) {
+    const rowRadius = attackType === 'radar' ? 3 : 2;
+    for (let rowOffset = -rowRadius; rowOffset <= rowRadius; rowOffset += 1) {
+      const columnRadius = attackType === 'radar'
+        ? Math.abs(rowOffset) <= 1 ? 3 : 4 - Math.abs(rowOffset)
+        : 2;
+      for (let columnOffset = -columnRadius; columnOffset <= columnRadius; columnOffset += 1) {
         const isTarget = attackType === 'normal'
           ? rowOffset === 0 && columnOffset === 0
           : attackType === 'cross'
             ? (rowOffset === 0 && columnOffset === 0)
               || (rowOffset === 0 && Math.abs(columnOffset) === 1)
               || (columnOffset === 0 && Math.abs(rowOffset) === 1)
-            : attackType === 'radar'
-              ? (rowOffset === 0 && Math.abs(columnOffset) <= 1)
-                || (columnOffset === 0 && Math.abs(rowOffset) <= 2)
-              : (rowOffset + columnOffset) % 2 === 0
+            : attackType === 'radar' || (rowOffset + columnOffset) % 2 === 0
         if (!isTarget) continue;
 
         const row = centerRow + rowOffset;
@@ -967,6 +968,17 @@ function attachRealtime(server, {
         break;
       }
 
+      case 'match:spectator:list': {
+        pruneMatches();
+        const activeMatches = [...matches.values()]
+          .filter((match) =>
+            match.status === 'playing' &&
+            match.game.phase === 'active')
+          .map((match) => matchSnapshot(match, socket.user.id));
+        send(socket, { type: 'match:spectator:list', matches: activeMatches });
+        break;
+      }
+
       case 'match:create': {
         if (!requireNoMatch(socket)) break;
         if (matches.size >= MAX_MATCHES) pruneMatches();
@@ -1032,10 +1044,7 @@ function attachRealtime(server, {
           messages: match.chat,
           actions: match.actions,
         });
-        broadcastMatch(match, {
-          type: 'match:updated',
-          match: matchSnapshot(match),
-        });
+        updateMatch(match);
         break;
       }
 
@@ -1063,10 +1072,7 @@ function attachRealtime(server, {
           messages: match.chat,
           actions: match.actions,
         });
-        broadcastMatch(match, {
-          type: 'match:updated',
-          match: matchSnapshot(match),
-        });
+        updateMatch(match);
         break;
       }
 
@@ -1200,20 +1206,37 @@ function attachRealtime(server, {
             sendError(socket, 'El ataque o la casilla no son válidos.', 'INVALID_ATTACK');
             break;
           }
-          const attackedCells = game.attackedCells.get(socket.user.id) || new Set();
-          if (targets.some((cell) => {
-            if (!attackedCells.has(cell)) return false;
-            const ship = targetFleet.find((candidate) => candidate.cells.includes(cell));
-            return ship?.type !== 'battleship'
-              || ship.damage.get(cell) >= SHIP_HIT_POINTS.battleship;
-          })) {
-            sendError(socket, 'El ataque incluye casillas que ya fueron atacadas.', 'CELL_ALREADY_ATTACKED');
+          const attackCenters = game.attackCenters.get(socket.user.id) || new Set();
+          const centerShip = targetFleet.find((ship) => ship.cells.includes(message.action.cell));
+          const centerDamage = centerShip?.damage.get(message.action.cell) ?? 0;
+          const canRetryCenter = (
+            centerShip?.type === 'seriousGirl' && centerDamage === 0
+          ) || (
+            centerShip?.type === 'battleship'
+            && centerDamage > 0
+            && centerDamage < SHIP_HIT_POINTS.battleship
+          );
+          if (attackCenters.has(message.action.cell) && !canRetryCenter) {
+            sendError(socket, 'Esa casilla ya fue el centro de un ataque.', 'CELL_ALREADY_ATTACKED');
             break;
           }
           if (attackType !== 'normal') consumeAmmo(game, socket.user.id, attackType);
           const results = targets.map((cell) => {
             const ship = targetFleet.find((candidate) => candidate.cells.includes(cell));
             if (!ship) return { cell, result: 'miss' };
+            const previousDamage = ship.damage.get(cell);
+            const hitPoints = SHIP_HIT_POINTS[ship.type];
+            if (previousDamage >= hitPoints) {
+              const shipSunk = shipIsSunk(ship);
+              return {
+                cell,
+                result: 'hit',
+                damage: previousDamage,
+                cellSunk: true,
+                shipSunk,
+                ...(shipSunk ? { shipCells: [...ship.cells] } : {}),
+              };
+            }
             if (ship.type === 'seriousGirl' && attackType === 'bombardment') {
               return { cell, result: 'evaded' };
             }
@@ -1221,22 +1244,26 @@ function attachRealtime(server, {
               ship.interceptAvailable = false;
               return { cell, result: 'intercepted' };
             }
-            ship.damage.set(cell, ship.damage.get(cell) + 1);
+            const damage = ship.type === 'battleship' && attackType === 'cross'
+              ? hitPoints
+              : previousDamage + 1;
+            ship.damage.set(cell, damage);
             if (ship.type === 'carrier') removeCarrierBonus(game, opponent.id);
-            const cellSunk = ship.damage.get(cell) >= SHIP_HIT_POINTS[ship.type];
+            const cellSunk = damage >= hitPoints;
+            const shipSunk = shipIsSunk(ship);
             return {
               cell,
               result: 'hit',
-              damage: ship.damage.get(cell),
+              damage,
               cellSunk,
-              shipSunk: shipIsSunk(ship),
+              resisted: ship.type === 'battleship' && !cellSunk,
+              shipSunk,
+              ...(shipSunk ? { shipCells: [...ship.cells] } : {}),
             };
           });
-          const nextAttackedCells = new Set(attackedCells);
-          results
-            .filter((result) => result.result !== 'evaded' && result.result !== 'intercepted')
-            .forEach((result) => nextAttackedCells.add(result.cell));
-          game.attackedCells.set(socket.user.id, nextAttackedCells);
+          const nextAttackCenters = new Set(attackCenters);
+          nextAttackCenters.add(message.action.cell);
+          game.attackCenters.set(socket.user.id, nextAttackCenters);
           const hasWon = targetFleet.every(shipIsSunk);
           if (hasWon) {
             game.phase = 'finished';

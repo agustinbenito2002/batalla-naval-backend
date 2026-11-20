@@ -102,10 +102,10 @@ origen rechazado en la terminal.
 La conexión debe proceder de un origen incluido en `CORS_ORIGINS` (en
 desarrollo también se permiten los orígenes locales configurados por el
 backend). El cliente debe enviar el mensaje `auth` en los primeros cinco
-segundos. Desde que lo recibe, el servidor puede tardar hasta 20 segundos en
-validar el token contra Supabase; si se supera ese plazo, envía el error
-`AUTHENTICATION_TIMEOUT` y cierra la conexión. Solo se permite una conexión
-activa por usuario; una conexión nueva reemplaza la anterior.
+segundos. Desde que lo recibe, el servidor puede tardar hasta 55 segundos en
+validar el token contra Supabase, incluyendo un reintento de red; si se supera
+ese plazo, envía el error `AUTHENTICATION_TIMEOUT` y cierra la conexión. Solo
+se permite una conexión activa por usuario; una conexión nueva reemplaza la anterior.
 Al autenticarse, el servidor envía `chat:presence` con la lista de usuarios
 conectados y vuelve a transmitirla cuando alguien se conecta o desconecta.
 La presencia es en memoria, solo incluye usuarios conectados por WebSocket a
@@ -121,6 +121,7 @@ Todos los mensajes son objetos JSON con un campo `type`.
 | `auth` | `token` | Autentica la conexión; debe ser el primer mensaje. |
 | `ping` | — | Solicita una respuesta `pong`. |
 | `match:list` | — | Lista las partidas públicas esperando un jugador. |
+| `match:spectator:list` | — | Lista todas las partidas con batalla activa que se pueden ver como espectador. |
 | `match:create` | `visibility` (`public` o `private`, opcional) | Crea una partida y asigna al creador el primer puesto de jugador. |
 | `match:join` | `matchId` | Se une como jugador a una partida disponible; el segundo jugador la inicia. |
 | `match:spectate` | `matchId` | Se une como espectador, sin permiso para enviar acciones del juego. |
@@ -147,18 +148,25 @@ Al comenzar, cada jugador recibe 5 municiones `cross`, 2 `bombardment` y 1
 `radar`; el ataque `normal` es ilimitado. El portaaviones intacto agrega una
 munición de cada tipo y pierde las que queden cuando recibe su primer impacto.
 El ataque en cruz alcanza cinco casillas, el bombardeo usa el patrón 5×5
-existente y el radar revela las naves en una cruz de siete casillas (cinco
-verticales y tres horizontales, compartiendo el centro). El radar no causa daño,
-no detecta a la Chica seria, consume la acción principal y termina el turno.
-Solo el jugador que lo usó recibe `match:radar:result`.
+existente y el radar revela 37 casillas con filas de 3, 5, 7, 7, 7, 5 y 3
+casillas. El radar no causa daño, no detecta a la Chica seria, consume la acción
+principal y termina el turno. Solo el jugador que lo usó recibe
+`match:radar:result`.
+
+Los ataques solo se rechazan si la casilla seleccionada ya fue el centro de un
+ataque; una casilla afectada como colateral todavía puede elegirse como centro.
+Se puede volver a elegir el centro si la Chica seria evadió un bombardeo o si
+el Acorazado resistió y esa casilla aún no se hundió. El daño de una casilla ya
+hundida no aumenta por impactos colaterales.
 
 El servidor sortea al azar quién empieza cuando ambas flotas están listas. La
 Coordinadora concede un ataque normal adicional en el turno mientras quede al
 menos una de sus tres casillas sin impacto. El Acorazado necesita dos impactos
-en cada casilla; la Vanguardia intercepta el primer impacto que recibe; la
-Chica seria evade el bombardeo. El servidor calcula impactos, hundimientos,
-munición y victoria, y rechaza ataques fuera de turno, munición agotada y
-repeticiones que no sean el segundo impacto de una casilla del Acorazado.
+en cada casilla, salvo que el ataque en cruz la hunde de inmediato; la
+Vanguardia intercepta el primer impacto que recibe; la Chica seria evade el
+bombardeo. El servidor calcula impactos, hundimientos, munición y victoria, y
+rechaza ataques fuera de turno, munición agotada y repeticiones que no sean el
+segundo impacto de una casilla del Acorazado.
 
 ## Eventos del servidor
 
@@ -185,8 +193,11 @@ repeticiones que no sean el segundo impacto de una casilla del Acorazado.
   `cancelled`).
 - `match:action`: acción procesada con `actionId`, `playerId`, `username`,
   `sentAt` y estado público `game`; ataques también incluyen `results` y
-  `winnerId` dentro de `action`. `game.ammo` contiene solo la munición del
-  usuario que recibe el evento.
+  `winnerId` dentro de `action`. El primer impacto a una casilla del Acorazado
+  incluye `resisted: true`; `cellSunk` indica que esa casilla ya recibió todo
+  su daño, mientras que `shipSunk` indica que se hundió el barco completo. Solo
+  al hundirse el barco se incluye `shipCells` con sus casillas.
+  `game.ammo` contiene solo la munición del usuario que recibe el evento.
 - `match:radar:result`: resultado privado del radar, con las casillas
   `{ cell, detected }`; solo lo recibe quien usó el radar.
 - `match:ended`: partida finalizada, por ejemplo cuando un jugador sale.

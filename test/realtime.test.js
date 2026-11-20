@@ -224,12 +224,66 @@ test('authenticated players and spectators can chat and exchange match actions',
   bob.send(JSON.stringify({ type: 'match:join', matchId }));
   await Promise.all([bobJoined, aliceUpdated]);
 
+  const charlie = await connect(server.address().port);
+  sockets.push(charlie);
+  await authenticate(charlie, 'charlie');
+  const waitingMatchCreated = waitForEvent(charlie, 'match:created');
+  charlie.send(JSON.stringify({ type: 'match:create', visibility: 'public' }));
+  const waitingMatch = await waitingMatchCreated;
+  assert.equal(waitingMatch.match.status, 'waiting');
+
+  const aliceFleetReady = waitForEvent(
+    alice,
+    'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'alice',
+  );
+  alice.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: createTestFleet() },
+  }));
+  await aliceFleetReady;
+  const bobFleetReady = waitForEvent(
+    alice,
+    'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'bob',
+  );
+  bob.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: createTestFleet() },
+  }));
+  const activeMatch = await bobFleetReady;
+  assert.equal(activeMatch.game.phase, 'active');
+
   const spectator = await connect(server.address().port);
   sockets.push(spectator);
   await authenticate(spectator, 'spectator');
+  const aliceMatchWithSpectator = waitForEvent(
+    alice,
+    'match:updated',
+    (event) => event.match.spectators === 1,
+  );
+  const bobMatchWithSpectator = waitForEvent(
+    bob,
+    'match:updated',
+    (event) => event.match.spectators === 1,
+  );
+  const spectatorMatchesResponse = waitForEvent(spectator, 'match:spectator:list');
+  spectator.send(JSON.stringify({ type: 'match:spectator:list' }));
+  const spectatorMatches = await spectatorMatchesResponse;
+  assert.deepEqual(spectatorMatches.matches.map((match) => match.id), [matchId]);
+  assert.equal(spectatorMatches.matches[0].game.phase, 'active');
+
   const spectating = waitForEvent(spectator, 'match:spectating');
   spectator.send(JSON.stringify({ type: 'match:spectate', matchId }));
-  await spectating;
+  const [aliceUpdatedForSpectator, bobUpdatedForSpectator] = await Promise.all([
+    aliceMatchWithSpectator,
+    bobMatchWithSpectator,
+    spectating,
+  ]).then(([aliceEvent, bobEvent]) => [aliceEvent, bobEvent]);
+  assert.equal(aliceUpdatedForSpectator.match.game.ammo.cross, 6);
+  assert.equal(bobUpdatedForSpectator.match.game.ammo.cross, 6);
 
   const spectatorError = waitForEvent(
     spectator,
@@ -844,30 +898,31 @@ test('direct challenges join a private match and alternate server-enforced turns
   first.send(JSON.stringify({
     type: 'match:action',
     matchId,
-    action: { type: 'attack', cell: 15, attackType: 'normal' },
+    action: { type: 'attack', cell: 200, attackType: 'cross' },
   }));
-  const interceptedAttack = await firstTurnEnds;
+  const firstCrossAttack = await firstTurnEnds;
   await firstTurnEcho;
-  assert.ok(interceptedAttack.action.results.some((result) =>
-    result.cell === 15 && result.result === 'intercepted'));
-  assert.equal(interceptedAttack.game.currentTurnId, firstPlayerId);
-  assert.equal(interceptedAttack.game.extraNormalAvailable, true);
+  assert.equal(firstCrossAttack.action.attackType, 'cross');
+  assert.ok(firstCrossAttack.action.results.some((result) =>
+    result.cell === 200 && result.result === 'miss'));
+  assert.equal(firstCrossAttack.game.currentTurnId, firstPlayerId);
+  assert.equal(firstCrossAttack.game.extraNormalAvailable, true);
 
-  const vanguardHitBySecondShot = waitForEvent(first, 'match:action',
+  const vanguardHitByExtraShot = waitForEvent(first, 'match:action',
     (event) => event.action?.type === 'attack');
-  const vanguardHitBySecondPlayer = waitForEvent(second, 'match:action',
+  const vanguardHitByExtraShotBySecond = waitForEvent(second, 'match:action',
     (event) => event.action?.type === 'attack');
   first.send(JSON.stringify({
     type: 'match:action',
     matchId,
-    action: { type: 'attack', cell: 16, attackType: 'normal' },
+    action: { type: 'attack', cell: 15, attackType: 'normal' },
   }));
-  const secondVanguardAttack = await vanguardHitBySecondShot;
-  await vanguardHitBySecondPlayer;
-  assert.ok(secondVanguardAttack.action.results.some((result) =>
-    result.cell === 16 && result.result === 'hit'));
-  assert.equal(secondVanguardAttack.game.currentTurnId, secondPlayerId);
-  assert.equal(secondVanguardAttack.game.turnNumber, 2);
+  const extraVanguardAttack = await vanguardHitByExtraShot;
+  await vanguardHitByExtraShotBySecond;
+  assert.ok(extraVanguardAttack.action.results.some((result) =>
+    result.cell === 15 && result.result === 'intercepted'));
+  assert.equal(extraVanguardAttack.game.currentTurnId, secondPlayerId);
+  assert.equal(extraVanguardAttack.game.turnNumber, 2);
 
   const radarBySecond = waitForEvent(second, 'match:radar:result');
   const radarActionBySecond = waitForEvent(second, 'match:action',
@@ -878,6 +933,9 @@ test('direct challenges join a private match and alternate server-enforced turns
     action: { type: 'radar', cell: 208 },
   }));
   const [radarResult, radarAction] = await Promise.all([radarBySecond, radarActionBySecond]);
+  assert.equal(radarResult.results.length, 22);
+  assert.ok(radarResult.results.some((result) => result.cell === 163));
+  assert.ok(!radarResult.results.some((result) => result.cell === 161));
   assert.ok(radarResult.results.some((result) => result.cell === 208 && !result.detected));
   assert.ok(radarResult.results.some((result) => result.cell === 209 && !result.detected));
   assert.equal(radarAction.game.currentTurnId, firstPlayerId);
@@ -899,28 +957,15 @@ test('direct challenges join a private match and alternate server-enforced turns
   assert.equal(bombardmentResult.game.currentTurnId, firstPlayerId);
   assert.equal(bombardmentResult.game.extraNormalAvailable, true);
 
-  const carrierHitBySecond = waitForEvent(second, 'match:action',
-    (event) => event.action?.type === 'attack' && event.action.attackType === 'normal');
-  const carrierHitByFirst = waitForEvent(first, 'match:action',
-    (event) => event.action?.type === 'attack' && event.action.attackType === 'normal');
-  const ammoAfterCarrierHit = waitForEvent(second, 'match:updated',
-    (event) => event.match.game.ammo?.radar === 1);
+  const chicaRetry = waitForEvent(first, 'match:action',
+    (event) => event.action?.type === 'attack' && event.action.cell === 208);
   first.send(JSON.stringify({
     type: 'match:action',
     matchId,
-    action: { type: 'attack', cell: 63, attackType: 'normal' },
+    action: { type: 'attack', cell: 208, attackType: 'normal' },
   }));
-  const carrierHit = await carrierHitBySecond;
-  await carrierHitByFirst;
-  assert.ok(carrierHit.action.results.some((result) => result.cell === 63 && result.result === 'hit'));
-  assert.deepEqual((await ammoAfterCarrierHit).match.game.ammo, {
-    cross: 5,
-    bombardment: 2,
-    radar: 1,
-    normal: 'infinite',
-  });
-  assert.equal(carrierHit.game.currentTurnId, secondPlayerId);
-  assert.equal(carrierHit.game.turnNumber, 4);
+  assert.ok((await chicaRetry).action.results.some((result) =>
+    result.cell === 208 && result.result === 'hit'));
 
   const armoredHitsByFirst = waitForEvent(first, 'match:action',
     (event) => event.action?.type === 'attack' && event.action.attackType === 'cross');
@@ -934,7 +979,12 @@ test('direct challenges join a private match and alternate server-enforced turns
   const armorFirstHit = await armoredHitsByFirst;
   await armoredHitsBySecond;
   assert.ok(armorFirstHit.action.results.some((result) =>
-    result.cell === 91 && result.result === 'hit' && result.damage === 1 && !result.cellSunk));
+    result.cell === 91 && result.result === 'hit' && result.damage === 2
+      && !result.resisted && result.cellSunk));
+  assert.ok(armorFirstHit.action.results.some((result) =>
+    result.cell === 90 && result.result === 'hit' && result.damage === 2 && result.cellSunk));
+  assert.ok(armorFirstHit.action.results.some((result) =>
+    result.cell === 92 && result.result === 'hit' && result.damage === 2 && result.cellSunk));
   assert.equal(armorFirstHit.game.currentTurnId, secondPlayerId);
   assert.equal(armorFirstHit.game.extraNormalAvailable, true);
 
@@ -945,12 +995,12 @@ test('direct challenges join a private match and alternate server-enforced turns
   second.send(JSON.stringify({
     type: 'match:action',
     matchId,
-    action: { type: 'attack', cell: 91, attackType: 'normal' },
+    action: { type: 'attack', cell: 90, attackType: 'normal' },
   }));
   const armorSecondHit = await armoredSecondHitByFirst;
   await armoredSecondHitBySecond;
   assert.ok(armorSecondHit.action.results.some((result) =>
-    result.cell === 91 && result.damage === 2 && result.cellSunk));
+    result.cell === 90 && result.damage === 2 && result.cellSunk));
   assert.equal(armorSecondHit.game.currentTurnId, firstPlayerId);
   assert.equal(armorSecondHit.game.turnNumber, 5);
 
@@ -1007,38 +1057,90 @@ test('direct challenges join a private match and alternate server-enforced turns
   }));
   await Promise.all([finalCoordinatorHit, finalCoordinatorHitBySecond]);
   const finishExtraByFirst = waitForEvent(first, 'match:action',
-    (event) => event.action?.type === 'attack' && event.action.cell === 33);
+    (event) => event.action?.type === 'attack' && event.action.cell === 63);
   const finishExtraBySecond = waitForEvent(second, 'match:action',
-    (event) => event.action?.type === 'attack' && event.action.cell === 33);
+    (event) => event.action?.type === 'attack' && event.action.cell === 63);
+  const ammoAfterCarrierHit = waitForEvent(second, 'match:updated',
+    (event) => event.match.game.ammo?.radar === 1);
   first.send(JSON.stringify({
     type: 'match:action',
     matchId,
-    action: { type: 'attack', cell: 33, attackType: 'normal' },
+    action: { type: 'attack', cell: 63, attackType: 'normal' },
   }));
   const [lastExtraAttack] = await Promise.all([finishExtraByFirst, finishExtraBySecond]);
+  assert.ok(lastExtraAttack.action.results.some((result) =>
+    result.cell === 63 && result.result === 'hit'));
+  assert.deepEqual((await ammoAfterCarrierHit).match.game.ammo, {
+    cross: 5,
+    bombardment: 2,
+    radar: 1,
+    normal: 'infinite',
+  });
   assert.equal(lastExtraAttack.game.currentTurnId, secondPlayerId);
   assert.equal(lastExtraAttack.game.extraNormalAvailable, false);
 
-  const chicaHitByFirst = waitForEvent(first, 'match:action',
-    (event) => event.action?.type === 'attack' && event.action.cell === 208);
-  const chicaHitBySecond = waitForEvent(second, 'match:action',
-    (event) => event.action?.type === 'attack' && event.action.cell === 208);
+  const sunkBattleshipError = waitForEvent(second, 'error',
+    (event) => event.code === 'CELL_ALREADY_ATTACKED');
   second.send(JSON.stringify({
     type: 'match:action',
     matchId,
-    action: { type: 'attack', cell: 208, attackType: 'normal' },
+    action: { type: 'attack', cell: 91, attackType: 'normal' },
   }));
-  const chicaAttack = await chicaHitByFirst;
-  await chicaHitBySecond;
-  assert.ok(chicaAttack.action.results.some((result) =>
-    result.cell === 208 && result.result === 'hit'));
+  await sunkBattleshipError;
+
+  const battleshipFirstNormalHit = waitForEvent(first, 'match:action',
+    (event) => event.action?.type === 'attack' && event.action.cell === 93);
+  const battleshipFirstNormalHitBySecond = waitForEvent(second, 'match:action',
+    (event) => event.action?.type === 'attack' && event.action.cell === 93);
+  second.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'attack', cell: 93, attackType: 'normal' },
+  }));
+  const resistedBattleshipCell = await battleshipFirstNormalHit;
+  await battleshipFirstNormalHitBySecond;
+  assert.ok(resistedBattleshipCell.action.results.some((result) =>
+    result.cell === 93 && result.damage === 1 && result.resisted && !result.cellSunk));
+  assert.ok(resistedBattleshipCell.action.results.every((result) => !result.shipSunk));
 
   const repeatedCellError = waitForEvent(first, 'error',
     (event) => event.code === 'CELL_ALREADY_ATTACKED');
   first.send(JSON.stringify({
     type: 'match:action',
     matchId,
-    action: { type: 'attack', cell: 63, attackType: 'normal' },
+    action: { type: 'attack', cell: 208, attackType: 'normal' },
   }));
   await repeatedCellError;
+
+  const retryTurnPrimary = waitForEvent(first, 'match:action',
+    (event) => event.action?.type === 'attack' && event.action.cell === 213);
+  const retryTurnExtra = waitForEvent(first, 'match:action',
+    (event) => event.action?.type === 'attack' && event.action.cell === 214);
+  first.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'attack', cell: 213, attackType: 'normal' },
+  }));
+  await retryTurnPrimary;
+  first.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'attack', cell: 214, attackType: 'normal' },
+  }));
+  await retryTurnExtra;
+
+  const battleshipSecondNormalHit = waitForEvent(first, 'match:action',
+    (event) => event.action?.type === 'attack' && event.action.cell === 93);
+  const battleshipSecondNormalHitBySecond = waitForEvent(second, 'match:action',
+    (event) => event.action?.type === 'attack' && event.action.cell === 93);
+  second.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'attack', cell: 93, attackType: 'normal' },
+  }));
+  const sunkBattleshipCell = await battleshipSecondNormalHit;
+  await battleshipSecondNormalHitBySecond;
+  assert.ok(sunkBattleshipCell.action.results.some((result) =>
+    result.cell === 93 && result.damage === 2 && result.cellSunk && result.shipSunk
+      && result.shipCells.join(',') === '90,91,92,93'));
 });
