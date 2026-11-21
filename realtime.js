@@ -10,6 +10,9 @@ const MAX_MATCHES = 500;
 const MATCH_TTL_MS = 2 * 60 * 60 * 1000;
 const BOARD_SIZE = 15;
 const BOARD_CELLS = BOARD_SIZE * BOARD_SIZE;
+const MAX_FLEET_POINTS = 12;
+const MAX_STACKED_EFFECTS = 2;
+const MAX_EXTRA_AMMO = 3;
 const AUTH_MESSAGE_TIMEOUT_MS = 5000;
 const AUTH_VALIDATION_TIMEOUT_MS = 55000;
 const AUTH_RETRY_DELAY_MS = 500;
@@ -372,7 +375,7 @@ function attachRealtime(server, {
         turnNumber: 0,
         winnerId: null,
         primaryActionAvailable: false,
-        extraNormalAvailable: false,
+        extraNormalAvailable: 0,
       },
       createdAt: new Date(now).toISOString(),
       lastActivity: now,
@@ -383,16 +386,20 @@ function attachRealtime(server, {
   }
 
   function validateFleet(ships) {
-    if (!Array.isArray(ships) || ships.length !== Object.keys(SHIP_LENGTHS).length) return null;
+    if (!Array.isArray(ships) || ships.length === 0) return null;
     const occupied = new Set();
     const fleet = [];
-    const seenTypes = new Set();
+    const typeCounts = new Map();
+    let fleetPoints = 0;
 
     for (const ship of ships) {
       if (!ship || typeof ship !== 'object' || Array.isArray(ship) ||
           !Object.prototype.hasOwnProperty.call(SHIP_LENGTHS, ship.type) ||
-          seenTypes.has(ship.type) ||
           !Array.isArray(ship.cells) || ship.cells.length !== SHIP_LENGTHS[ship.type]) return null;
+      const typeCount = (typeCounts.get(ship.type) || 0) + 1;
+      typeCounts.set(ship.type, typeCount);
+      fleetPoints += SHIP_LENGTHS[ship.type];
+      if (fleetPoints > MAX_FLEET_POINTS) return null;
       const cells = new Set(ship.cells);
       if (cells.size !== ship.cells.length ||
           [...cells].some((cell) => !Number.isInteger(cell) || cell < 0 || cell >= BOARD_CELLS)) {
@@ -412,16 +419,25 @@ function attachRealtime(server, {
       if (!contiguous) return null;
 
       cells.forEach((cell) => occupied.add(cell));
-      seenTypes.add(ship.type);
+      const stackableEffectActive = (
+        (ship.type === 'coordinator' || ship.type === 'carrier')
+        && typeCount <= MAX_STACKED_EFFECTS
+      );
       fleet.push({
         type: ship.type,
         cells: [...cells],
         damage: new Map([...cells].map((cell) => [cell, 0])),
+        stackableEffectActive,
         interceptAvailable: ship.type === 'vanguard',
+        carrierBonusActive: ship.type === 'carrier' && stackableEffectActive,
+        carrierBonusRemaining: ship.type === 'carrier'
+          ? stackableEffectActive
+            ? { ...CARRIER_BONUS_AMMO }
+            : { cross: 0, bombardment: 0, radar: 0 }
+          : null,
       });
     }
 
-    if (seenTypes.size !== Object.keys(SHIP_LENGTHS).length) return null;
     return fleet;
   }
 
@@ -468,33 +484,55 @@ function attachRealtime(server, {
     };
   }
 
-  function createPlayerAmmo() {
+  function createPlayerAmmo(unspentPoints, fleet) {
+    const pointsAsAmmo = Math.min(unspentPoints, MAX_EXTRA_AMMO);
+    const carriers = fleet.filter((ship) => ship.type === 'carrier');
     return Object.fromEntries(Object.keys(INITIAL_AMMO).map((type) => [type, {
-      base: INITIAL_AMMO[type],
-      carrierBonus: CARRIER_BONUS_AMMO[type],
+      base: INITIAL_AMMO[type] + pointsAsAmmo,
+      carrierBonus: carriers.reduce(
+        (total, carrier) => total + carrier.carrierBonusRemaining[type],
+        0,
+      ),
     }]));
   }
 
   function consumeAmmo(game, userId, type) {
     const ammo = game.ammo.get(userId)?.[type];
     if (!ammo || ammo.base + ammo.carrierBonus <= 0) return false;
-    if (ammo.carrierBonus > 0) ammo.carrierBonus -= 1;
-    else ammo.base -= 1;
+    const carrier = game.fleets.get(userId)?.find((ship) =>
+      ship.type === 'carrier' &&
+      ship.carrierBonusActive &&
+      ship.carrierBonusRemaining[type] > 0);
+    if (carrier) {
+      carrier.carrierBonusRemaining[type] -= 1;
+      ammo.carrierBonus -= 1;
+    } else {
+      ammo.base -= 1;
+    }
     return true;
   }
 
-  function removeCarrierBonus(game, userId) {
+  function removeCarrierBonus(game, userId, carrier) {
     const ammo = game.ammo.get(userId);
-    if (!ammo) return;
+    if (!ammo || !carrier.carrierBonusActive) return;
     for (const type of Object.keys(CARRIER_BONUS_AMMO)) {
-      ammo[type].carrierBonus = 0;
+      const bonus = carrier.carrierBonusRemaining[type];
+      ammo[type].carrierBonus = Math.max(0, ammo[type].carrierBonus - bonus);
+      carrier.carrierBonusRemaining[type] = 0;
     }
+    carrier.carrierBonusActive = false;
   }
 
-  function coordinatorCanGrantExtra(fleet) {
-    const coordinator = fleet.find((ship) => ship.type === 'coordinator');
-    return Boolean(coordinator && coordinator.cells.some((cell) =>
-      coordinator.damage.get(cell) < SHIP_HIT_POINTS.coordinator));
+  function coordinatorExtraShots(fleet) {
+    return Math.min(
+      MAX_STACKED_EFFECTS,
+      fleet.filter((ship) =>
+        ship.type === 'coordinator' && ship.stackableEffectActive && !shipIsSunk(ship)).length,
+    );
+  }
+
+  function getShipHitPoints(ship) {
+    return SHIP_HIT_POINTS[ship.type];
   }
 
   function beginTurn(match, userId, incrementTurn = true) {
@@ -502,7 +540,7 @@ function attachRealtime(server, {
     game.currentTurnId = userId;
     if (incrementTurn) game.turnNumber += 1;
     game.primaryActionAvailable = true;
-    game.extraNormalAvailable = coordinatorCanGrantExtra(game.fleets.get(userId));
+    game.extraNormalAvailable = coordinatorExtraShots(game.fleets.get(userId));
   }
 
   function advanceTurn(match) {
@@ -512,7 +550,7 @@ function attachRealtime(server, {
 
   function shipIsSunk(ship) {
     return ship.cells.every((cell) =>
-      ship.damage.get(cell) >= SHIP_HIT_POINTS[ship.type]);
+      ship.damage.get(cell) >= getShipHitPoints(ship));
   }
 
   function publishMatchAction(match, socket, action) {
@@ -1111,13 +1149,17 @@ function attachRealtime(server, {
           if (!fleet) {
             sendError(
               socket,
-              'La flota debe incluir una nave de cada clase, rectas, contiguas y sin superposición.',
+              'La flota debe costar hasta 12 puntos y tener naves rectas, contiguas y sin superposición.',
               'INVALID_FLEET',
             );
             break;
           }
           match.game.fleets.set(socket.user.id, fleet);
-          match.game.ammo.set(socket.user.id, createPlayerAmmo());
+          const usedPoints = fleet.reduce((total, ship) => total + SHIP_LENGTHS[ship.type], 0);
+          match.game.ammo.set(
+            socket.user.id,
+            createPlayerAmmo(MAX_FLEET_POINTS - usedPoints, fleet),
+          );
           if (match.game.fleets.size === 2) {
             match.game.phase = 'active';
             beginTurn(match, match.players[randomInt(0, match.players.length)].id);
@@ -1163,11 +1205,12 @@ function attachRealtime(server, {
             }
             const results = targets.map((cell) => {
               const ship = targetFleet.find((candidate) =>
-                candidate.type !== 'seriousGirl' && candidate.cells.includes(cell));
+                candidate.type !== 'seriousGirl'
+                && candidate.cells.includes(cell));
               return { cell, detected: Boolean(ship) };
             });
             game.primaryActionAvailable = false;
-            game.extraNormalAvailable = false;
+            game.extraNormalAvailable = 0;
             advanceTurn(match);
             const actionId = randomUUID();
             publishMatchAction(match, socket, {
@@ -1214,7 +1257,7 @@ function attachRealtime(server, {
           ) || (
             centerShip?.type === 'battleship'
             && centerDamage > 0
-            && centerDamage < SHIP_HIT_POINTS.battleship
+            && centerDamage < getShipHitPoints(centerShip)
           );
           if (attackCenters.has(message.action.cell) && !canRetryCenter) {
             sendError(socket, 'Esa casilla ya fue el centro de un ataque.', 'CELL_ALREADY_ATTACKED');
@@ -1225,7 +1268,7 @@ function attachRealtime(server, {
             const ship = targetFleet.find((candidate) => candidate.cells.includes(cell));
             if (!ship) return { cell, result: 'miss' };
             const previousDamage = ship.damage.get(cell);
-            const hitPoints = SHIP_HIT_POINTS[ship.type];
+            const hitPoints = getShipHitPoints(ship);
             if (previousDamage >= hitPoints) {
               const shipSunk = shipIsSunk(ship);
               return {
@@ -1248,7 +1291,7 @@ function attachRealtime(server, {
               ? hitPoints
               : previousDamage + 1;
             ship.damage.set(cell, damage);
-            if (ship.type === 'carrier') removeCarrierBonus(game, opponent.id);
+            if (ship.type === 'carrier') removeCarrierBonus(game, opponent.id, ship);
             const cellSunk = damage >= hitPoints;
             const shipSunk = shipIsSunk(ship);
             return {
@@ -1270,11 +1313,11 @@ function attachRealtime(server, {
             game.winnerId = socket.user.id;
             game.currentTurnId = null;
             game.primaryActionAvailable = false;
-            game.extraNormalAvailable = false;
+            game.extraNormalAvailable = 0;
           } else {
             if (isExtraAttack) {
-              game.extraNormalAvailable = false;
-              advanceTurn(match);
+              game.extraNormalAvailable -= 1;
+              if (!game.extraNormalAvailable) advanceTurn(match);
             } else {
               game.primaryActionAvailable = false;
               if (!game.extraNormalAvailable) advanceTurn(match);

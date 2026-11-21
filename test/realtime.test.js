@@ -149,7 +149,6 @@ function createTestFleet() {
     { type: 'vanguard', cells: [15, 16, 17] },
     { type: 'coordinator', cells: [30, 31, 32] },
     { type: 'battleship', cells: [90, 91, 92, 93] },
-    { type: 'carrier', cells: [60, 61, 62, 63] },
   ];
 }
 
@@ -282,8 +281,8 @@ test('authenticated players and spectators can chat and exchange match actions',
     bobMatchWithSpectator,
     spectating,
   ]).then(([aliceEvent, bobEvent]) => [aliceEvent, bobEvent]);
-  assert.equal(aliceUpdatedForSpectator.match.game.ammo.cross, 6);
-  assert.equal(bobUpdatedForSpectator.match.game.ammo.cross, 6);
+  assert.equal(aliceUpdatedForSpectator.match.game.ammo.cross, 5);
+  assert.equal(bobUpdatedForSpectator.match.game.ammo.cross, 5);
 
   const spectatorError = waitForEvent(
     spectator,
@@ -869,9 +868,9 @@ test('direct challenges join a private match and alternate server-enforced turns
   assert.equal(bobMatch.match.game.currentTurnId, firstPlayerId);
   assert.equal(aliceMatch.match.game.turnNumber, 1);
   assert.deepEqual(aliceMatch.match.game.ammo, {
-    cross: 6,
-    bombardment: 3,
-    radar: 2,
+    cross: 5,
+    bombardment: 2,
+    radar: 1,
     normal: 'infinite',
   });
   assert.deepEqual(bobMatch.match.game.ammo, aliceMatch.match.game.ammo);
@@ -906,7 +905,7 @@ test('direct challenges join a private match and alternate server-enforced turns
   assert.ok(firstCrossAttack.action.results.some((result) =>
     result.cell === 200 && result.result === 'miss'));
   assert.equal(firstCrossAttack.game.currentTurnId, firstPlayerId);
-  assert.equal(firstCrossAttack.game.extraNormalAvailable, true);
+  assert.equal(firstCrossAttack.game.extraNormalAvailable, 1);
 
   const vanguardHitByExtraShot = waitForEvent(first, 'match:action',
     (event) => event.action?.type === 'attack');
@@ -955,7 +954,7 @@ test('direct challenges join a private match and alternate server-enforced turns
   assert.ok(bombardmentResult.action.results.some((result) =>
     result.cell === 208 && result.result === 'evaded'));
   assert.equal(bombardmentResult.game.currentTurnId, firstPlayerId);
-  assert.equal(bombardmentResult.game.extraNormalAvailable, true);
+  assert.equal(bombardmentResult.game.extraNormalAvailable, 1);
 
   const chicaRetry = waitForEvent(first, 'match:action',
     (event) => event.action?.type === 'attack' && event.action.cell === 208);
@@ -986,7 +985,7 @@ test('direct challenges join a private match and alternate server-enforced turns
   assert.ok(armorFirstHit.action.results.some((result) =>
     result.cell === 92 && result.result === 'hit' && result.damage === 2 && result.cellSunk));
   assert.equal(armorFirstHit.game.currentTurnId, secondPlayerId);
-  assert.equal(armorFirstHit.game.extraNormalAvailable, true);
+  assert.equal(armorFirstHit.game.extraNormalAvailable, 1);
 
   const armoredSecondHitByFirst = waitForEvent(first, 'match:action',
     (event) => event.action?.type === 'attack' && event.action.attackType === 'normal');
@@ -1060,8 +1059,6 @@ test('direct challenges join a private match and alternate server-enforced turns
     (event) => event.action?.type === 'attack' && event.action.cell === 63);
   const finishExtraBySecond = waitForEvent(second, 'match:action',
     (event) => event.action?.type === 'attack' && event.action.cell === 63);
-  const ammoAfterCarrierHit = waitForEvent(second, 'match:updated',
-    (event) => event.match.game.ammo?.radar === 1);
   first.send(JSON.stringify({
     type: 'match:action',
     matchId,
@@ -1069,15 +1066,9 @@ test('direct challenges join a private match and alternate server-enforced turns
   }));
   const [lastExtraAttack] = await Promise.all([finishExtraByFirst, finishExtraBySecond]);
   assert.ok(lastExtraAttack.action.results.some((result) =>
-    result.cell === 63 && result.result === 'hit'));
-  assert.deepEqual((await ammoAfterCarrierHit).match.game.ammo, {
-    cross: 5,
-    bombardment: 2,
-    radar: 1,
-    normal: 'infinite',
-  });
+    result.cell === 63 && result.result === 'miss'));
   assert.equal(lastExtraAttack.game.currentTurnId, secondPlayerId);
-  assert.equal(lastExtraAttack.game.extraNormalAvailable, false);
+  assert.equal(lastExtraAttack.game.extraNormalAvailable, 0);
 
   const sunkBattleshipError = waitForEvent(second, 'error',
     (event) => event.code === 'CELL_ALREADY_ATTACKED');
@@ -1143,4 +1134,272 @@ test('direct challenges join a private match and alternate server-enforced turns
   assert.ok(sunkBattleshipCell.action.results.some((result) =>
     result.cell === 93 && result.damage === 2 && result.cellSunk && result.shipSunk
       && result.shipCells.join(',') === '90,91,92,93'));
+});
+
+test('fleet points buy extra ammo and active ships stack their bonuses', async (t) => {
+  const server = http.createServer();
+  const realtime = attachRealtime(server, {
+    allowedOrigins: new Set(['http://localhost:5173']),
+    authenticate: async (token) => ({
+      id: `${token}-id`,
+      user_metadata: { nombre_usuario: token },
+    }),
+  });
+  const sockets = [];
+  server.listen(0);
+  await once(server, 'listening');
+  t.after(async () => {
+    await realtime.close();
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    for (const socket of sockets) {
+      if (socket.readyState === WebSocket.OPEN) socket.terminate();
+    }
+  });
+
+  const alice = await connect(server.address().port);
+  const bob = await connect(server.address().port);
+  sockets.push(alice, bob);
+  await Promise.all([authenticate(alice, 'alice'), authenticate(bob, 'bob')]);
+
+  const created = waitForEvent(alice, 'match:created');
+  alice.send(JSON.stringify({ type: 'match:create', visibility: 'public' }));
+  const matchId = (await created).match.id;
+  const joined = waitForEvent(bob, 'match:joined');
+  bob.send(JSON.stringify({ type: 'match:join', matchId }));
+  await joined;
+
+  const overspentFleet = [
+    { type: 'battleship', cells: [90, 91, 92, 93] },
+    { type: 'battleship', cells: [105, 106, 107, 108] },
+    { type: 'carrier', cells: [60, 61, 62, 63] },
+    { type: 'seriousGirl', cells: [208, 209] },
+  ];
+  const overspentError = waitForEvent(alice, 'error', (event) => event.code === 'INVALID_FLEET');
+  alice.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: overspentFleet },
+  }));
+  await overspentError;
+
+  const overBudgetDuplicates = [
+    { type: 'seriousGirl', cells: [0, 1] },
+    { type: 'seriousGirl', cells: [15, 16] },
+    { type: 'seriousGirl', cells: [30, 31] },
+    { type: 'seriousGirl', cells: [45, 46] },
+    { type: 'seriousGirl', cells: [60, 61] },
+    { type: 'seriousGirl', cells: [75, 76] },
+    { type: 'seriousGirl', cells: [90, 91] },
+  ];
+  const duplicateError = waitForEvent(alice, 'error', (event) => event.code === 'INVALID_FLEET');
+  alice.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: overBudgetDuplicates },
+  }));
+  await duplicateError;
+
+  const aliceFleet = [
+    { type: 'coordinator', cells: [30, 31, 32] },
+    { type: 'coordinator', cells: [45, 46, 47] },
+    { type: 'coordinator', cells: [60, 61, 62] },
+    { type: 'seriousGirl', cells: [208, 209] },
+  ];
+  const bobFleet = [
+    { type: 'carrier', cells: [60, 61, 62, 63] },
+    { type: 'carrier', cells: [75, 76, 77, 78] },
+    { type: 'carrier', cells: [90, 91, 92, 93] },
+  ];
+  const aliceReady = waitForEvent(alice, 'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'alice-id');
+  alice.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: aliceFleet },
+  }));
+  await aliceReady;
+
+  const aliceStarted = waitForEvent(alice, 'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'bob-id');
+  const bobStarted = waitForEvent(bob, 'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'bob-id');
+  bob.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: bobFleet },
+  }));
+  const [aliceGame, bobGame] = await Promise.all([aliceStarted, bobStarted]);
+  assert.deepEqual(aliceGame.game.ammo, {
+    cross: 6,
+    bombardment: 3,
+    radar: 2,
+    normal: 'infinite',
+  });
+  assert.deepEqual(bobGame.game.ammo, {
+    cross: 7,
+    bombardment: 4,
+    radar: 3,
+    normal: 'infinite',
+  });
+
+  const aliceId = 'alice-id';
+  const bobId = 'bob-id';
+  const observeAttack = (cell) => Promise.all([
+    waitForEvent(alice, 'match:action',
+      (event) => event.action?.type === 'attack' && event.action.cell === cell),
+    waitForEvent(bob, 'match:action',
+      (event) => event.action?.type === 'attack' && event.action.cell === cell),
+  ]);
+  const sendAttack = async (socket, cell, attackType = 'normal') => {
+    const observed = observeAttack(cell);
+    socket.send(JSON.stringify({
+      type: 'match:action',
+      matchId,
+      action: { type: 'attack', cell, attackType },
+    }));
+    return observed;
+  };
+
+  let currentPlayerId = aliceGame.game.currentTurnId;
+  assert.equal(aliceGame.game.extraNormalAvailable, currentPlayerId === aliceId ? 2 : 0);
+  if (currentPlayerId === bobId) {
+    const [, bobOpening] = await sendAttack(bob, 0);
+    assert.equal(bobOpening.game.currentTurnId, aliceId);
+  }
+
+  const [aliceCross] = await sendAttack(alice, 200, 'cross');
+  assert.equal(aliceCross.game.currentTurnId, aliceId);
+  assert.equal(aliceCross.game.extraNormalAvailable, 2);
+  const [aliceExtraOne] = await sendAttack(alice, 202);
+  assert.equal(aliceExtraOne.game.currentTurnId, aliceId);
+  assert.equal(aliceExtraOne.game.extraNormalAvailable, 1);
+  const [, aliceExtraTwo] = await sendAttack(alice, 204);
+  assert.equal(aliceExtraTwo.game.currentTurnId, bobId);
+  assert.equal(aliceExtraTwo.game.extraNormalAvailable, 0);
+
+  const [, bobTurn] = await sendAttack(bob, 2);
+  assert.equal(bobTurn.game.currentTurnId, aliceId);
+  const [, carrierHit] = await sendAttack(alice, 60);
+  assert.ok(carrierHit.action.results.some((result) =>
+    result.cell === 60 && result.result === 'hit' && result.cellSunk));
+  assert.deepEqual(carrierHit.game.ammo, {
+    cross: 6,
+    bombardment: 3,
+    radar: 2,
+    normal: 'infinite',
+  });
+});
+
+test('innate ship effects apply to every vanguard and serious girl', async (t) => {
+  const server = http.createServer();
+  const realtime = attachRealtime(server, {
+    allowedOrigins: new Set(['http://localhost:5173']),
+    authenticate: async (token) => ({
+      id: `${token}-id`,
+      user_metadata: { nombre_usuario: token },
+    }),
+  });
+  const sockets = [];
+  server.listen(0);
+  await once(server, 'listening');
+  t.after(async () => {
+    await realtime.close();
+    if (server.listening) await new Promise((resolve) => server.close(resolve));
+    for (const socket of sockets) {
+      if (socket.readyState === WebSocket.OPEN) socket.terminate();
+    }
+  });
+
+  const alice = await connect(server.address().port);
+  const bob = await connect(server.address().port);
+  sockets.push(alice, bob);
+  await Promise.all([authenticate(alice, 'alice'), authenticate(bob, 'bob')]);
+
+  const created = waitForEvent(alice, 'match:created');
+  alice.send(JSON.stringify({ type: 'match:create', visibility: 'public' }));
+  const matchId = (await created).match.id;
+  const joined = waitForEvent(bob, 'match:joined');
+  bob.send(JSON.stringify({ type: 'match:join', matchId }));
+  await joined;
+
+  const aliceFleet = [
+    { type: 'vanguard', cells: [0, 1, 2] },
+    { type: 'vanguard', cells: [15, 16, 17] },
+    { type: 'vanguard', cells: [30, 31, 32] },
+    { type: 'seriousGirl', cells: [45, 46] },
+  ];
+  const bobFleet = [
+    { type: 'seriousGirl', cells: [60, 61] },
+    { type: 'seriousGirl', cells: [75, 76] },
+    { type: 'seriousGirl', cells: [90, 91] },
+    { type: 'seriousGirl', cells: [105, 106] },
+    { type: 'seriousGirl', cells: [120, 121] },
+    { type: 'seriousGirl', cells: [135, 136] },
+  ];
+  const aliceReady = waitForEvent(alice, 'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'alice-id');
+  alice.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: aliceFleet },
+  }));
+  await aliceReady;
+  const aliceStarted = waitForEvent(alice, 'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'bob-id');
+  const bobStarted = waitForEvent(bob, 'match:action',
+    (event) => event.action?.type === 'fleet:ready' && event.playerId === 'bob-id');
+  bob.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'fleet:ready', ships: bobFleet },
+  }));
+  const [aliceGame] = await Promise.all([aliceStarted, bobStarted]);
+
+  const attack = async (socket, cell, attackType = 'normal') => {
+    const observed = Promise.all([
+      waitForEvent(alice, 'match:action',
+        (event) => event.action?.type === 'attack' && event.action.cell === cell),
+      waitForEvent(bob, 'match:action',
+        (event) => event.action?.type === 'attack' && event.action.cell === cell),
+    ]);
+    socket.send(JSON.stringify({
+      type: 'match:action',
+      matchId,
+      action: { type: 'attack', cell, attackType },
+    }));
+    return observed;
+  };
+  const bobPlayerId = 'bob-id';
+  if (aliceGame.game.currentTurnId === bobPlayerId) {
+    const [vanguardHit] = await attack(bob, 30);
+    assert.ok(vanguardHit.action.results.some((result) =>
+      result.cell === 30 && result.result === 'intercepted'
+      && !Object.hasOwn(result, 'damage')));
+  }
+
+  const radarResultByAlice = waitForEvent(alice, 'match:radar:result');
+  const radarActionByAlice = waitForEvent(alice, 'match:action',
+    (event) => event.action?.type === 'radar');
+  alice.send(JSON.stringify({
+    type: 'match:action',
+    matchId,
+    action: { type: 'radar', cell: 90 },
+  }));
+  const [radarResult] = await Promise.all([radarResultByAlice, radarActionByAlice]);
+  for (const cell of bobFleet.flatMap((ship) => ship.cells)) {
+    assert.ok(radarResult.results.some((result) => result.cell === cell && !result.detected));
+  }
+
+  if (aliceGame.game.currentTurnId === 'bob-id') {
+    await attack(bob, 200);
+  } else {
+    const [vanguardHit] = await attack(bob, 30);
+    assert.ok(vanguardHit.action.results.some((result) =>
+      result.cell === 30 && result.result === 'intercepted'
+      && !Object.hasOwn(result, 'damage')));
+  }
+
+  const [bombardment] = await attack(alice, 90, 'bombardment');
+  assert.ok(bombardment.action.results.some((result) =>
+    result.cell === 90 && result.result === 'evaded'));
 });

@@ -140,12 +140,23 @@ partida como jugador o espectador. Los mensajes de una partida nunca se envían
 al chat general ni a otras partidas. Los mensajes generales se conservan como
 máximo una hora.
 
-`fleet:ready` debe enviar cinco objetos `{ type, cells }`, uno de cada tipo:
-`seriousGirl` (2 casillas), `vanguard` (3), `coordinator` (3), `battleship` (4)
-y `carrier` (4). Las naves deben ser rectas, contiguas y no superponerse.
+Cada jugador dispone de 12 puntos para comprar su flota; el coste de cada nave
+es igual a su número de casillas. Se pueden repetir tipos de nave, sin otro
+límite que el presupuesto y el tamaño del tablero: `seriousGirl` (2),
+`vanguard` (3), `coordinator` (3), `battleship` (4) y `carrier` (4). Los
+puntos no gastados se convierten en hasta tres municiones adicionales de cada
+tipo especial. Después de comprar, `fleet:ready` envía los objetos
+`{ type, cells }` de las naves compradas. Las naves deben ser rectas, contiguas
+y no superponerse; el servidor valida el coste.
 
 Al comenzar, cada jugador recibe 5 municiones `cross`, 2 `bombardment` y 1
-`radar`; el ataque `normal` es ilimitado. El portaaviones intacto agrega una
+`radar`, además de la munición adicional comprada con puntos sobrantes; el
+ataque `normal` es ilimitado. Solo se acumulan los ataques extra de las
+Coordinadoras y la munición extra de los portaaviones, hasta dos de cada tipo.
+Los demás efectos son propios de cada nave: cada Vanguardia intercepta una vez
+su primer impacto, cada Chica seria es inmune al bombardeo y al radar, y cada
+Acorazado necesita dos impactos por casilla, salvo que un ataque en cruz la
+hunde de inmediato. Cada uno de hasta dos portaaviones operativos agrega una
 munición de cada tipo y pierde las que queden cuando recibe su primer impacto.
 El ataque en cruz alcanza cinco casillas, el bombardeo usa el patrón 5×5
 existente y el radar revela 37 casillas con filas de 3, 5, 7, 7, 7, 5 y 3
@@ -159,14 +170,11 @@ Se puede volver a elegir el centro si la Chica seria evadió un bombardeo o si
 el Acorazado resistió y esa casilla aún no se hundió. El daño de una casilla ya
 hundida no aumenta por impactos colaterales.
 
-El servidor sortea al azar quién empieza cuando ambas flotas están listas. La
-Coordinadora concede un ataque normal adicional en el turno mientras quede al
-menos una de sus tres casillas sin impacto. El Acorazado necesita dos impactos
-en cada casilla, salvo que el ataque en cruz la hunde de inmediato; la
-Vanguardia intercepta el primer impacto que recibe; la Chica seria evade el
-bombardeo. El servidor calcula impactos, hundimientos, munición y victoria, y
-rechaza ataques fuera de turno, munición agotada y repeticiones que no sean el
-segundo impacto de una casilla del Acorazado.
+El servidor sortea al azar quién empieza cuando ambas flotas están listas.
+Cada una de hasta dos Coordinadoras operativas concede un ataque normal
+adicional por turno. El servidor calcula impactos, hundimientos, munición y
+victoria, y rechaza ataques fuera de turno, munición agotada y repeticiones que
+no sean el segundo impacto de una casilla del Acorazado.
 
 ## Eventos del servidor
 
@@ -194,9 +202,11 @@ segundo impacto de una casilla del Acorazado.
 - `match:action`: acción procesada con `actionId`, `playerId`, `username`,
   `sentAt` y estado público `game`; ataques también incluyen `results` y
   `winnerId` dentro de `action`. El primer impacto a una casilla del Acorazado
-  incluye `resisted: true`; `cellSunk` indica que esa casilla ya recibió todo
-  su daño, mientras que `shipSunk` indica que se hundió el barco completo. Solo
-  al hundirse el barco se incluye `shipCells` con sus casillas.
+  incluye `resisted: true`; una intercepción de la Vanguardia se indica con
+  `result: "intercepted"` y no causa daño (el cliente puede mostrar su casilla
+  con contorno violeta y sin relleno). `cellSunk` indica que esa casilla ya
+  recibió todo su daño, mientras que `shipSunk` indica que se hundió el barco
+  completo. Solo al hundirse el barco se incluye `shipCells` con sus casillas.
   `game.ammo` contiene solo la munición del usuario que recibe el evento.
 - `match:radar:result`: resultado privado del radar, con las casillas
   `{ cell, detected }`; solo lo recibe quien usó el radar.
@@ -207,8 +217,9 @@ El objeto `match` incluye `id`, `visibility`, `status` (`waiting` o `playing`),
 `players` (con estado `online`), cantidad de `spectators`, `yourRole` y
 `createdAt`. También contiene `game` (`phase`, `currentTurnId`, `turnNumber`,
 `winnerId`, `readyPlayerIds`, `primaryActionAvailable`, `extraNormalAvailable`
-y la munición del receptor); nunca incluye la posición ni el daño detallado de
-las flotas. Las partidas siguen en memoria y solo pueden emparejar usuarios
+(cantidad de ataques normales extra disponibles en el turno) y la munición del
+receptor); nunca incluye la posición ni el daño detallado de las flotas. Las
+partidas siguen en memoria y solo pueden emparejar usuarios
 conectados a la misma instancia del backend. Los mensajes de chat admiten hasta
 500 caracteres. Los marcos WebSocket están limitados a 16 KiB y las conexiones
 se limitan para evitar envíos excesivos.
